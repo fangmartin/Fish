@@ -6,15 +6,15 @@ import { bodyLimit } from 'hono/body-limit'
 import { getCookie, setCookie } from 'hono/cookie'
 import { HTTPException } from 'hono/http-exception'
 import { streamSSE } from 'hono/streaming'
-import type { FeedingRecord, GoldenFeast, TankEvents, TankTicker } from '../shared/contracts'
+import type { FeedingRecord, GoldenFeast, RationState, TankEvents, TankTicker } from '../shared/contracts'
 import {
-  DAILY_RATION_LIMIT, GOLDEN_FEAST_EVERY_FEEDS, GOLDEN_FEAST_LIFETIME_MS, MAX_ACTIVE_FISH_PER_KEEPER,
-  MAX_ART_BYTES, MAX_ART_EDGE, PELLET_LIFETIME_MS, REPORT_HIDE_THRESHOLD, TANK_VIEW_LIMIT,
-  allocateStats, applyGoldenFeast, canRespec, feedFish, getBellyCapacity, getBellyState, getDigestIntervalMs,
-  getGrowth, remainingRations, shanghaiDate, validateEyes,
+  GOLDEN_FEAST_EVERY_FEEDS, GOLDEN_FEAST_LIFETIME_MS, MAX_ACTIVE_FISH_PER_KEEPER, MAX_ART_BYTES, MAX_ART_EDGE,
+  MAX_RATIONS, PELLET_LIFETIME_MS, RATION_REGEN_INTERVAL_MS, REPORT_HIDE_THRESHOLD, TANK_VIEW_LIMIT,
+  allocateStats, applyGoldenFeast, canRespec, consumeRation, feedFish, getBellyCapacity, getBellyState, getDigestIntervalMs,
+  getGrowth, settleOnlineRations, shanghaiDate, validateEyes,
 } from '../shared/domain'
 import { parseArtwork } from './art'
-import { openStorage, presentFish, type FishRow, type KeeperRow } from './storage'
+import { openStorage, presentFish, type AfterCommit, type FishRow, type KeeperRow } from './storage'
 
 interface Options {
   dataDir: string
@@ -34,6 +34,12 @@ interface PelletRow {
 }
 
 type EventListener = (event: keyof TankEvents, data: string) => void
+interface OnlinePresence {
+  streams: Set<EventListener>
+  lastSettledAt: number
+  nextRegenAt: number | null
+}
+type RationRow = { rations: number; ration_progress_ms: number }
 const safeId = /^[a-z0-9-]{1,64}$/
 const cookieName = 'fish_keeper'
 const passcodeAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
@@ -72,8 +78,12 @@ export function createApp(options: Options) {
   const root = new Hono()
   const api = new Hono()
   const listeners = new Set<EventListener>()
+  const onlineKeepers = new Map<string, OnlinePresence>()
+  let regenTimer: ReturnType<typeof setInterval> | undefined
+  const readRations = db.prepare('SELECT rations, ration_progress_ms FROM keepers WHERE id = ?')
+  const writeRations = db.prepare('UPDATE keepers SET rations = ?, ration_progress_ms = ? WHERE id = ?')
 
-  function broadcast<K extends keyof TankEvents>(event: K, value: TankEvents[K]) {
+  function broadcast<K extends Exclude<keyof TankEvents, 'rations_updated'>>(event: K, value: TankEvents[K]) {
     const data = JSON.stringify(value)
     for (const listener of listeners) listener(event, data)
   }
@@ -155,12 +165,75 @@ export function createApp(options: Options) {
     if (!result.changes) fail(429, action === 'register' ? '这个网络今天创建的养鱼人已达上限' : '操作有点频繁，请稍后再试')
   }
 
-  function rations(keeperId: string, time: number) {
-    const { count } = db.prepare(`
-      SELECT COUNT(*) AS count FROM pellets
-      WHERE keeper_id = ? AND COALESCE(dropped_date, consumed_date) = ?
-    `).get(keeperId, shanghaiDate(time)) as { count: number }
-    return remainingRations(count)
+  function syncKeeperRations(
+    keeperId: string, time: number,
+    { afterCommit = effect => effect(), spend = false }: { afterCommit?: AfterCommit; spend?: boolean } = {},
+  ): RationState {
+    const row = readRations.get(keeperId) as RationRow
+    const presence = onlineKeepers.get(keeperId)
+    const settledAt = presence ? Math.max(time, presence.lastSettledAt) : time
+    const elapsed = presence ? settledAt - presence.lastSettledAt : 0
+    const settled = settleOnlineRations(row.rations, row.ration_progress_ms, elapsed)
+    const next = spend ? consumeRation(settled.rations, settled.progressMs) : settled
+    if (!next) fail(409, '鱼食已用完，留在页面每分钟恢复 1 颗')
+    if (next.rations !== row.rations || next.progressMs !== row.ration_progress_ms) {
+      writeRations.run(next.rations, next.progressMs, keeperId)
+    }
+    const state = { remainingRations: next.rations, nextRationInSec: next.nextRationInSec }
+    if (presence) afterCommit(() => {
+      presence.lastSettledAt = settledAt
+      presence.nextRegenAt = next.rations < MAX_RATIONS ? settledAt + RATION_REGEN_INTERVAL_MS - next.progressMs : null
+      if (settled.gained) {
+        const data = JSON.stringify(state)
+        for (const listener of presence.streams) listener('rations_updated', data)
+      }
+    })
+    return state
+  }
+
+  function checkRationRegen() {
+    const time = now()
+    for (const [keeperId, presence] of onlineKeepers) {
+      if (presence.nextRegenAt === null || time < presence.nextRegenAt) continue
+      try { syncKeeperRations(keeperId, time) } catch (error) { console.error(error) }
+    }
+  }
+
+  function connectKeeper(keeperId: string, listener: EventListener) {
+    let presence = onlineKeepers.get(keeperId)
+    if (!presence) {
+      const time = now()
+      const row = readRations.get(keeperId) as RationRow
+      presence = {
+        streams: new Set(), lastSettledAt: time,
+        nextRegenAt: row.rations < MAX_RATIONS ? time + RATION_REGEN_INTERVAL_MS - row.ration_progress_ms : null,
+      }
+      onlineKeepers.set(keeperId, presence)
+      regenTimer ??= setInterval(checkRationRegen, 1000).unref()
+    }
+    presence.streams.add(listener)
+  }
+
+  function disconnectKeeper(keeperId: string, listener: EventListener) {
+    const presence = onlineKeepers.get(keeperId)
+    if (!presence || !presence.streams.delete(listener) || presence.streams.size) return
+    try {
+      syncKeeperRations(keeperId, now())
+    } catch (error) {
+      console.error(error)
+    } finally {
+      onlineKeepers.delete(keeperId)
+      if (!onlineKeepers.size) {
+        clearInterval(regenTimer)
+        regenTimer = undefined
+      }
+    }
+  }
+
+  function pauseRationRegen() {
+    for (const [keeperId, presence] of onlineKeepers) {
+      for (const listener of presence.streams) disconnectKeeper(keeperId, listener)
+    }
   }
 
   function ensureTankCanEat(time: number) {
@@ -223,7 +296,7 @@ export function createApp(options: Options) {
     const fish = (db.prepare(`${fishSelect} WHERE f.keeper_id = ? ORDER BY f.created_at DESC`).all(keeper.id) as FishRow[])
       .map(row => presentFish(row, time))
     return c.json({
-      keeper, remainingRations: rations(keeper.id, time),
+      keeper, ...syncKeeperRations(keeper.id, time),
       activeFish: fish.filter(item => item.status === 'active'),
       archivedFish: fish.filter(item => item.status === 'archived'),
     })
@@ -244,7 +317,7 @@ export function createApp(options: Options) {
       return code
     })
     issueCookie(c, session)
-    return c.json({ keeper: { id, nickname, passcode }, remainingRations: DAILY_RATION_LIMIT }, 201)
+    return c.json({ keeper: { id, nickname, passcode }, remainingRations: MAX_RATIONS, nextRationInSec: 0 }, 201)
   })
 
   api.post('/keeper/recover', async c => {
@@ -258,7 +331,7 @@ export function createApp(options: Options) {
     if (!row) fail(404, '通行码不存在')
     const { session, ...keeper } = row
     issueCookie(c, session)
-    return c.json({ keeper, remainingRations: rations(keeper.id, now()) })
+    return c.json({ keeper, ...syncKeeperRations(keeper.id, now()) })
   })
 
   api.post('/keeper/nickname', async c => {
@@ -495,16 +568,15 @@ export function createApp(options: Options) {
     const pelletId = randomUUID()
     const expiresAt = time + PELLET_LIFETIME_MS
     useRateLimit(c, 'drop', String(Math.floor(time / 60_000)), options.dropLimit ?? 30)
-    const remaining = transaction(() => {
+    const rationState = transaction(afterCommit => {
       ensureTankCanEat(time)
       db.prepare("UPDATE pellets SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?").run(time)
-      const available = rations(keeper.id, time)
-      if (!available) fail(409, '今天的投喂配额已用完')
+      const rationState = syncKeeperRations(keeper.id, time, { afterCommit, spend: true })
       db.prepare(`INSERT INTO pellets(id, keeper_id, x, y, expires_at, dropped_date, status)
         VALUES (?, ?, ?, ?, ?, ?, 'pending')`).run(pelletId, keeper.id, x, y, expiresAt, shanghaiDate(time))
-      return available - 1
+      return rationState
     })
-    return c.json({ pelletId, x, y, expiresAt, remainingRations: remaining }, 201)
+    return c.json({ pelletId, x, y, expiresAt, ...rationState }, 201)
   })
 
   api.post('/pellets/:pelletId/claim', async c => {
@@ -513,9 +585,10 @@ export function createApp(options: Options) {
     const { winnerFishId } = await readBody(c)
     if (typeof winnerFishId !== 'string' || !safeId.test(winnerFishId)) fail(400, '需要指定有效的鱼')
     const time = now()
-    const result = transaction(() => {
+    const result = transaction(afterCommit => {
       const pellet = ownedPellet(pelletId, keeper)
       if (pellet.status !== 'pending') fail(409, '这颗鱼食已失效')
+      const rationState = syncKeeperRations(keeper.id, time, { afterCommit })
       if (pellet.expires_at <= time) {
         db.prepare("UPDATE pellets SET status = 'expired' WHERE id = ?").run(pelletId)
         return null
@@ -527,7 +600,7 @@ export function createApp(options: Options) {
       const { value } = db.prepare("UPDATE tank_state SET value = value + 1 WHERE key = 'normal_feeds_total' RETURNING value")
         .get() as { value: number }
       return {
-        claim: { outcome, fish, remainingRations: rations(keeper.id, time), levelDelta },
+        claim: { outcome, fish, levelDelta, ...rationState },
         feast: value % GOLDEN_FEAST_EVERY_FEEDS === 0 ? spawnFeast(time) : null,
       }
     })
@@ -542,12 +615,15 @@ export function createApp(options: Options) {
   api.post('/pellets/:pelletId/cancel', c => {
     const keeper = requireKeeper(c)
     const time = now()
-    const pellet = ownedPellet(c.req.param('pelletId'), keeper)
-    if (pellet.status === 'pending') {
-      db.prepare('UPDATE pellets SET status = ? WHERE id = ?')
-        .run(pellet.expires_at > time ? 'cancelled' : 'expired', pellet.id)
-    }
-    return c.json({ remainingRations: rations(keeper.id, time) })
+    const state = transaction(afterCommit => {
+      const pellet = ownedPellet(c.req.param('pelletId'), keeper)
+      if (pellet.status === 'pending') {
+        db.prepare('UPDATE pellets SET status = ? WHERE id = ?')
+          .run(pellet.expires_at > time ? 'cancelled' : 'expired', pellet.id)
+      }
+      return syncKeeperRations(keeper.id, time, { afterCommit })
+    })
+    return c.json(state)
   })
 
   api.post('/golden-feast/:id/claim', async c => {
@@ -573,6 +649,7 @@ export function createApp(options: Options) {
   })
 
   api.get('/events', c => {
+    const keeper = keeperFor(c)
     c.header('X-Accel-Buffering', 'no')
     return streamSSE(c, async stream => {
       await new Promise<void>(resolve => {
@@ -580,10 +657,12 @@ export function createApp(options: Options) {
           void stream.writeSSE({ event, data })
         }
         listeners.add(listener)
-        const heartbeat = setInterval(() => void stream.writeSSE({ event: 'heartbeat', data: '{}' }), 25_000)
+        if (keeper) connectKeeper(keeper.id, listener)
+        const heartbeat = setInterval(() => void stream.writeSSE({ event: 'heartbeat', data: '{}' }), 25_000).unref()
         stream.onAbort(() => {
           clearInterval(heartbeat)
           listeners.delete(listener)
+          if (keeper) disconnectKeeper(keeper.id, listener)
           resolve()
         })
         void stream.writeSSE({ event: 'ready', data: '{}' })
@@ -599,5 +678,5 @@ export function createApp(options: Options) {
     return c.json({ error: '鱼缸暂时无法处理这次请求' }, 500)
   })
 
-  return { app: root, db }
+  return { app: root, db, pauseRationRegen }
 }

@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
-  DAILY_RATION_LIMIT, EMPTY_STATS, LEVEL_XP_COSTS, MAX_ACTIVE_FISH_PER_KEEPER, MAX_EXPERIENCE,
-  MAX_LEVEL, MAX_STAT_VALUE, REPORT_HIDE_THRESHOLD, STAT_KEYS, TANK_VIEW_LIMIT,
+  EMPTY_STATS, LEVEL_XP_COSTS, MAX_ACTIVE_FISH_PER_KEEPER, MAX_EXPERIENCE, MAX_RATIONS,
+  MAX_LEVEL, MAX_STAT_VALUE, RATION_REGEN_INTERVAL_MS, REPORT_HIDE_THRESHOLD, STAT_KEYS, TANK_VIEW_LIMIT,
   EYE_STYLES, GOLDEN_FEAST_BONUS_XP, GOLDEN_FEAST_EVERY_FEEDS, GOLDEN_FEAST_LIFETIME_MS, MAX_FISH_EYES,
-  allocateStats, applyGoldenFeast, canRespec, dailyCount, feedFish, formatDuration,
+  allocateStats, applyGoldenFeast, canRespec, consumeRation, dailyCount, feedFish, formatDuration,
   getBellyCapacity, getBellyMovementFactor, getBellyState, getBuildTitle, getDigestIntervalMs,
-  getGoldenFeastBellyCost, getGrowth, getStuffedComaMs, remainingRations,
+  getGoldenFeastBellyCost, getGrowth, getStuffedComaMs, settleOnlineRations,
   shanghaiDate, unspentPoints, validateEyes, type FeedingState, type StatKey,
 } from '../shared/domain'
 
@@ -50,14 +50,34 @@ describe('共享领域规则', () => {
       .toBe('六边形战神')
   })
 
-  it('固定每日配额、在缸容量、水域切片与举报门槛', () => {
-    expect([DAILY_RATION_LIMIT, MAX_ACTIVE_FISH_PER_KEEPER, TANK_VIEW_LIMIT, REPORT_HIDE_THRESHOLD])
+  it('固定鱼食罐容量、在缸容量、水域切片与举报门槛', () => {
+    expect([MAX_RATIONS, MAX_ACTIVE_FISH_PER_KEEPER, TANK_VIEW_LIMIT, REPORT_HIDE_THRESHOLD])
       .toEqual([20, 3, 35, 3])
-    expect(remainingRations(0)).toBe(20)
-    expect(remainingRations(1)).toBe(19)
-    expect(remainingRations(19)).toBe(1)
-    expect(remainingRations(20)).toBe(0)
-    expect(remainingRations(21)).toBe(0)
+    expect(RATION_REGEN_INTERVAL_MS).toBe(60_000)
+  })
+
+  it('在线累计每分钟补一颗，满罐清空进度，负值和小数按规则截断', () => {
+    expect(settleOnlineRations(20, 1000, 120_000)).toEqual({ rations: 20, progressMs: 0, gained: 0, nextRationInSec: 0 })
+    expect(settleOnlineRations(25, 0, 0)).toEqual({ rations: 20, progressMs: 0, gained: 0, nextRationInSec: 0 })
+    expect(settleOnlineRations(8.9, 20_000.9, 15_000.9))
+      .toEqual({ rations: 8, progressMs: 35_000, gained: 0, nextRationInSec: 25 })
+    expect(settleOnlineRations(8, 35_000, 26_001))
+      .toEqual({ rations: 9, progressMs: 1001, gained: 1, nextRationInSec: 59 })
+    expect(settleOnlineRations(8, 0, 185_000))
+      .toEqual({ rations: 11, progressMs: 5000, gained: 3, nextRationInSec: 55 })
+    expect(settleOnlineRations(19, 47_000, 600_000))
+      .toEqual({ rations: 20, progressMs: 0, gained: 1, nextRationInSec: 0 })
+    expect(settleOnlineRations(-2.9, -1000, -1000))
+      .toEqual({ rations: 0, progressMs: 0, gained: 0, nextRationInSec: 60 })
+    expect(settleOnlineRations(2, 59_999, 0))
+      .toEqual({ rations: 2, progressMs: 59_999, gained: 0, nextRationInSec: 1 })
+  })
+
+  it('投放扣一颗，未满时保留恢复进度，满罐时从零开始', () => {
+    expect(consumeRation(20, 20_000)).toEqual({ rations: 19, progressMs: 0, nextRationInSec: 60 })
+    expect(consumeRation(5.8, 20_001)).toEqual({ rations: 4, progressMs: 20_001, nextRationInSec: 40 })
+    expect(consumeRation(1, 59_999)).toEqual({ rations: 0, progressMs: 59_999, nextRationInSec: 1 })
+    expect(consumeRation(0, 20_000)).toBeNull()
   })
 
   it('阶梯经验曲线每升一级加一点，在 33 经验和 18 级封顶', () => {

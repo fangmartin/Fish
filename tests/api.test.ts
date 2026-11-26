@@ -3,9 +3,9 @@ import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PNG } from 'pngjs'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { Claim, Fish, FishProfile, GoldenFeast, GoldenFeastClaim, Keeper, KeeperResponse, Leaderboard, Pellet, TankView } from '../shared/contracts'
-import { GOLDEN_FEAST_LIFETIME_MS, MAX_ART_BYTES, MAX_ART_EDGE, getStuffedComaMs } from '../shared/domain'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { Claim, Fish, FishProfile, GoldenFeast, GoldenFeastClaim, Keeper, KeeperResponse, Leaderboard, Pellet, RationState, TankView } from '../shared/contracts'
+import { GOLDEN_FEAST_LIFETIME_MS, MAX_ART_BYTES, MAX_ART_EDGE, MAX_RATIONS, RATION_REGEN_INTERVAL_MS, getStuffedComaMs } from '../shared/domain'
 import { createApp } from '../server/app'
 
 const date = Date.parse('2026-03-04T15:58:00Z')
@@ -44,9 +44,10 @@ async function JSONresponse<T>(response: Response, status = 200) {
 
 async function register(nickname: string, ip?: string) {
   const response = await request('/keeper/register', { body: { nickname }, ip })
-  const { keeper } = await JSONresponse<{ keeper: Keeper }>(response, 201)
+  const created = await JSONresponse<{ keeper: Keeper } & RationState>(response, 201)
+  expect(created).toMatchObject({ remainingRations: 20, nextRationInSec: 0 })
   const header = response.headers.get('set-cookie')!
-  return { cookie: header.split(';')[0], header, keeper }
+  return { cookie: header.split(';')[0], header, keeper: created.keeper }
 }
 
 async function release(cookie: string, name: string, extra: object = {}) {
@@ -60,6 +61,41 @@ async function drop(cookie: string, ip?: string) {
 
 function claim(cookie: string, pelletId: string, winnerFishId: string) {
   return request(`/pellets/${pelletId}/claim`, { cookie, body: { winnerFishId } })
+}
+
+const jar = async (cookie: string) => {
+  const state = await JSONresponse<RationState>(await request('/keeper/me', { cookie }))
+  return { remainingRations: state.remainingRations, nextRationInSec: state.nextRationInSec }
+}
+
+async function openEvents(cookie?: string) {
+  const response = await request('/events', { cookie })
+  expect(response.headers.get('content-type')).toContain('text/event-stream')
+  const reader = response.body!.getReader()
+  const decoder = new TextDecoder()
+  let buffered = ''
+
+  async function next() {
+    while (!buffered.includes('\n\n')) {
+      const chunk = await reader.read()
+      if (chunk.done) throw new Error('Unexpected end of event stream')
+      buffered += decoder.decode(chunk.value, { stream: true })
+    }
+    const boundary = buffered.indexOf('\n\n')
+    const entry = buffered.slice(0, boundary)
+    buffered = buffered.slice(boundary + 2)
+    return { name: entry.match(/^event: (.*)$/m)![1], data: JSON.parse(entry.match(/^data: (.*)$/m)![1]) as object }
+  }
+
+  async function event(name: string) {
+    for (;;) {
+      const message = await next()
+      if (message.name === name) return message.data
+    }
+  }
+
+  expect((await next()).name).toBe('ready')
+  return { next, event, close: () => reader.cancel() }
 }
 
 const view = (query = '', cookie?: string) =>
@@ -278,7 +314,7 @@ describe('SQLite API', () => {
     expect(first.keeper.passcode).toMatch(/^FISH-[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$/)
     expect((await request('/keeper/register', { cookie: first.cookie, body: { nickname: '重复' } })).status).toBe(409)
     const recovered = await request('/keeper/recover', { body: { passcode: first.keeper.passcode.toLowerCase() } })
-    expect(await JSONresponse(recovered)).toMatchObject({ keeper: first.keeper, remainingRations: 20 })
+    expect(await JSONresponse(recovered)).toMatchObject({ keeper: first.keeper, remainingRations: 20, nextRationInSec: 0 })
     const secondSession = recovered.headers.get('set-cookie')!.split(';')[0]
     expect(await JSONresponse(await request('/keeper/nickname', { cookie: secondSession, body: { nickname: '  海风  ' } })))
       .toMatchObject({ keeper: { id: first.keeper.id, nickname: '海风' } })
@@ -364,7 +400,7 @@ describe('SQLite API', () => {
     expect(byNeighbor.fish).toHaveLength(20)
   })
 
-  it('投放即扣减，结算防重复，取消或超时也计入每日 20 颗配额', async () => {
+  it('投放即扣减，结算防重复，取消或超时不返还鱼食', async () => {
     const { cookie } = await register('投喂者')
     const { cookie: other } = await register('围观者')
     const fish = await release(cookie, '绿光')
@@ -373,18 +409,18 @@ describe('SQLite API', () => {
     const b = await drop(cookie)
     const c = await drop(cookie)
     expect([a.remainingRations, b.remainingRations, c.remainingRations]).toEqual([19, 18, 17])
-    expect(a).toMatchObject({ x: 0.38, y: 0.44, expiresAt: time + 90_000 })
+    expect(a).toMatchObject({ x: 0.38, y: 0.44, expiresAt: time + 90_000, nextRationInSec: 60 })
     expect((await claim(other, b.pelletId, fish.id)).status).toBe(403)
     expect((await claim(cookie, a.pelletId, 'missing')).status).toBe(409)
     expect(await JSONresponse(await request(`/pellets/${b.pelletId}/cancel`, { method: 'POST', cookie })))
-      .toEqual({ remainingRations: 17 })
+      .toEqual({ remainingRations: 17, nextRationInSec: 60 })
     expect((await claim(cookie, b.pelletId, fish.id)).status).toBe(409)
     const submissions = await Promise.all([
       claim(cookie, a.pelletId, fish.id), claim(cookie, a.pelletId, fish.id), claim(cookie, a.pelletId, fish.id),
     ])
     expect(submissions.map(res => res.status).sort()).toEqual([200, 409, 409])
     const growth = await JSONresponse<Claim>(submissions.find(res => res.ok)!)
-    expect(growth).toMatchObject({ outcome: 'leveled_up', remainingRations: 17, levelDelta: 1,
+    expect(growth).toMatchObject({ outcome: 'leveled_up', remainingRations: 17, nextRationInSec: 60, levelDelta: 1,
       fish: { experience: 1, level: 2, dailyEatsCount: 1, bellyUsed: 1, bellyCapacity: 3, unspentPoints: 1 } })
     time += 90_000
     expect(await JSONresponse(await request('/keeper/me', { cookie }))).toMatchObject({ remainingRations: 17 })
@@ -392,31 +428,174 @@ describe('SQLite API', () => {
     expect(service.db.prepare('SELECT status FROM pellets WHERE id = ?').get(c.pelletId))
       .toMatchObject({ status: 'expired' })
     expect(await JSONresponse(await request(`/pellets/${c.pelletId}/cancel`, { method: 'POST', cookie })))
-      .toEqual({ remainingRations: 17 })
+      .toEqual({ remainingRations: 17, nextRationInSec: 60 })
     for (let index = 16; index >= 0; index--) {
       expect((await drop(cookie)).remainingRations).toBe(index)
     }
     expect(await JSONresponse(await request('/pellets/drop', { cookie, body: { x: 0, y: 0 } }), 409))
-      .toMatchObject({ error: '今天的投喂配额已用完' })
+      .toMatchObject({ error: '鱼食已用完，留在页面每分钟恢复 1 颗' })
     const profile = await JSONresponse<{ fish: FishProfile }>(await request(`/fish/${fish.id}`))
     expect(profile.fish.feedingHistory).toHaveLength(1)
   })
 
-  it('23:59 投放的鱼食在上海零点结算时仍计入昨天', async () => {
+  it('离线时鱼食和进度不随上海午夜或时长变化，跨午夜正常结算进食', async () => {
     const { cookie } = await register('午夜投喂者')
     const fish = await release(cookie, '夜光')
     time = Date.parse('2026-03-04T15:59:00Z')
     const across = await drop(cookie)
     expect(across.remainingRations).toBe(19)
     time += 60_000
-    expect(await JSONresponse(await request('/keeper/me', { cookie }))).toMatchObject({ remainingRations: 20 })
+    expect(await jar(cookie)).toEqual({ remainingRations: 19, nextRationInSec: 60 })
     expect(await JSONresponse<Claim>(await claim(cookie, across.pelletId, fish.id)))
-      .toMatchObject({ outcome: 'leveled_up', fish: { dailyEatsCount: 1, experience: 1 }, remainingRations: 20 })
+      .toMatchObject({ outcome: 'leveled_up', fish: { dailyEatsCount: 1, experience: 1 }, remainingRations: 19, nextRationInSec: 60 })
     expect(service.db.prepare('SELECT dropped_date, consumed_date FROM pellets WHERE id = ?').get(across.pelletId))
       .toMatchObject({ dropped_date: '2026-03-04', consumed_date: '2026-03-05' })
-    expect((await drop(cookie)).remainingRations).toBe(19)
     const profile = await JSONresponse<{ fish: FishProfile }>(await request(`/fish/${fish.id}`))
     expect(profile.fish.feedingHistory[0].consumedAt).toBe(time)
+    const viewer = await openEvents()
+    try {
+      time += 6 * 60 * 60_000
+      expect(await jar(cookie)).toEqual({ remainingRations: 19, nextRationInSec: 60 })
+      expect((await drop(cookie)).remainingRations).toBe(18)
+    } finally {
+      await viewer.close()
+    }
+  })
+
+  it('登录 SSE 后按实际在线毫秒积累，跨上海午夜继续，最多恢复到 20 颗', async () => {
+    const { cookie, keeper } = await register('在线养鱼人')
+    await release(cookie, '在线鱼')
+    expect(await jar(cookie)).toEqual({ remainingRations: 20, nextRationInSec: 0 })
+    time = Date.parse('2026-03-04T15:59:35Z')
+    const first = await drop(cookie)
+    await drop(cookie)
+    const stream = await openEvents(cookie)
+    try {
+      time += 35_000
+      expect(await jar(cookie)).toEqual({ remainingRations: 18, nextRationInSec: 25 })
+      expect(await JSONresponse(await request('/keeper/recover', { body: { passcode: keeper.passcode } })))
+        .toMatchObject({ remainingRations: 18, nextRationInSec: 25 })
+      expect(await JSONresponse(await request(`/pellets/${first.pelletId}/cancel`, { cookie, method: 'POST' })))
+        .toEqual({ remainingRations: 18, nextRationInSec: 25 })
+      time += 25_000
+      expect(await jar(cookie)).toEqual({ remainingRations: 19, nextRationInSec: 60 })
+      time += 30 * RATION_REGEN_INTERVAL_MS
+      expect(await jar(cookie)).toEqual({ remainingRations: 20, nextRationInSec: 0 })
+      expect(await drop(cookie)).toMatchObject({ remainingRations: 19, nextRationInSec: 60 })
+    } finally {
+      await stream.close()
+    }
+  })
+
+  it('最后一个 SSE 关闭时保存 40 秒进度，十分钟离线后只需再在线 20 秒', async () => {
+    const { cookie, keeper } = await register('暂停养鱼人')
+    await release(cookie, '暂停鱼')
+    const stream = await openEvents(cookie)
+    try {
+      await drop(cookie)
+      time += 40_000
+    } finally {
+      await stream.close()
+    }
+    expect(service.db.prepare('SELECT ration_progress_ms FROM keepers WHERE id = ?').get(keeper.id))
+      .toEqual({ ration_progress_ms: 40_000 })
+    time += 10 * RATION_REGEN_INTERVAL_MS
+    expect(await jar(cookie)).toEqual({ remainingRations: 19, nextRationInSec: 20 })
+    const reopened = await openEvents(cookie)
+    try {
+      time += 20_000
+      expect(await jar(cookie)).toEqual({ remainingRations: 20, nextRationInSec: 0 })
+    } finally {
+      await reopened.close()
+    }
+  })
+
+  it('同一养鱼人的多个 SSE 合并计时，关闭一个后继续恢复', async () => {
+    const { cookie } = await register('多标签养鱼人')
+    await release(cookie, '多标签鱼')
+    for (let index = 0; index < 3; index++) await drop(cookie)
+    const first = await openEvents(cookie)
+    let second: Awaited<ReturnType<typeof openEvents>> | undefined
+    try {
+      time += 35_000
+      second = await openEvents(cookie)
+      time += 25_000
+      expect(await jar(cookie)).toEqual({ remainingRations: 18, nextRationInSec: 60 })
+      await first.close()
+      time += RATION_REGEN_INTERVAL_MS
+      expect(await jar(cookie)).toEqual({ remainingRations: 19, nextRationInSec: 60 })
+    } finally {
+      await first.close()
+      await second?.close()
+    }
+    time += RATION_REGEN_INTERVAL_MS
+    expect(await jar(cookie)).toEqual({ remainingRations: 19, nextRationInSec: 60 })
+  })
+
+  it('服务停止前保存在线进度，重启期间不累计', async () => {
+    const { cookie } = await register('重启养鱼人')
+    await release(cookie, '重启鱼')
+    const stream = await openEvents(cookie)
+    try {
+      await drop(cookie)
+      time += 31_000
+      service.pauseRationRegen()
+    } finally {
+      await stream.close()
+    }
+    service.db.close()
+    time += 10 * RATION_REGEN_INTERVAL_MS
+    service = openTestApp()
+    expect(await jar(cookie)).toEqual({ remainingRations: 19, nextRationInSec: 29 })
+  })
+
+  it('周期恢复仅向对应养鱼人的全部 SSE 推送私有补给', async () => {
+    const { cookie } = await register('补给养鱼人')
+    const other = await register('无关养鱼人')
+    await release(cookie, '补给鱼')
+    await drop(cookie)
+    const streams: Awaited<ReturnType<typeof openEvents>>[] = []
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    try {
+      for (const session of [cookie, cookie, other.cookie, undefined]) streams.push(await openEvents(session))
+      time += 59_000
+      vi.advanceTimersByTime(1000)
+      const early = await release(cookie, '到期前的标记鱼')
+      for (const stream of streams) {
+        expect(await stream.next()).toMatchObject({ name: 'fish_released', data: { fish: { id: early.id } } })
+      }
+      time += 1000
+      vi.advanceTimersByTime(1000)
+      const marker = await release(other.cookie, '广播标记鱼')
+      for (const stream of streams.slice(0, 2)) {
+        expect(await stream.next()).toEqual({
+          name: 'rations_updated', data: { remainingRations: 20, nextRationInSec: 0 },
+        })
+      }
+      for (const stream of streams.slice(2)) {
+        expect(await stream.next()).toMatchObject({ name: 'fish_released', data: { fish: { id: marker.id } } })
+      }
+    } finally {
+      for (const stream of streams) await stream.close()
+      vi.useRealTimers()
+    }
+  })
+
+  it('进食结算回滚时不会提前推进在线恢复时间', async () => {
+    const { cookie, keeper } = await register('事务养鱼人')
+    await release(cookie, '事务鱼')
+    const pellet = await drop(cookie)
+    const stream = await openEvents(cookie)
+    try {
+      time += 35_000
+      expect((await claim(cookie, pellet.pelletId, 'missing')).status).toBe(409)
+      expect(service.db.prepare('SELECT rations, ration_progress_ms FROM keepers WHERE id = ?').get(keeper.id))
+        .toEqual({ rations: 19, ration_progress_ms: 0 })
+      time += 25_000
+      expect(await jar(cookie)).toEqual({ remainingRations: 20, nextRationInSec: 0 })
+    } finally {
+      await stream.close()
+    }
   })
 
   it('空缸和全缸鱼都撑不动时拒绝投放，鱼只在消化完成后恢复投喂', async () => {
@@ -440,7 +619,7 @@ describe('SQLite API', () => {
     expect((await drop(cookie)).remainingRations).toBe(19)
   })
 
-  it('启动迁移没有 dropped_date 的 SQLite，并按旧进食日期统计历史配额', async () => {
+  it('启动迁移没有 dropped_date 的旧鱼食表，并保留食物记录', async () => {
     const { cookie } = await register('升级前养鱼人')
     const fish = await release(cookie, '旧库鱼')
     const legacy = await drop(cookie)
@@ -461,6 +640,25 @@ describe('SQLite API', () => {
       .toMatchObject({ dropped_date: '2026-03-04' })
   })
 
+  it('旧 keeper 表迁移后从满罐开始，保留身份、鱼和已结算记录', async () => {
+    const { cookie, keeper } = await register('旧罐养鱼人')
+    const fish = await release(cookie, '旧罐鱼')
+    const pellet = await drop(cookie)
+    await JSONresponse(await claim(cookie, pellet.pelletId, fish.id))
+    service.db.exec('ALTER TABLE keepers DROP COLUMN rations; ALTER TABLE keepers DROP COLUMN ration_progress_ms')
+    service.db.close()
+    service = openTestApp()
+    expect(await JSONresponse<KeeperResponse>(await request('/keeper/me', { cookie }))).toMatchObject({
+      keeper, remainingRations: MAX_RATIONS, nextRationInSec: 0, activeFish: [{ id: fish.id, experience: 1 }],
+    })
+    expect(service.db.prepare('SELECT status, winner_fish_id FROM pellets WHERE id = ?').get(pellet.pelletId))
+      .toEqual({ status: 'consumed', winner_fish_id: fish.id })
+    await drop(cookie)
+    service.db.close()
+    service = openTestApp()
+    expect(await jar(cookie)).toEqual({ remainingRations: 19, nextRationInSec: 60 })
+  })
+
   it('一人养一条鱼，当天升鱼王，次日升到满级鱼皇', async () => {
     time = Date.parse('2026-03-04T01:00:00Z')
     const { cookie } = await register('养鱼人')
@@ -478,6 +676,10 @@ describe('SQLite API', () => {
     for (let xp = 19; xp <= 23; xp++) expect((await feed()).fish.experience).toBe(xp)
     expect(await JSONresponse(await request('/keeper/me', { cookie }))).toMatchObject({ remainingRations: 0 })
     time = Date.parse('2026-03-05T01:00:00Z')
+    expect(await jar(cookie)).toEqual({ remainingRations: 0, nextRationInSec: 60 })
+    const stream = await openEvents(cookie)
+    time += MAX_RATIONS * RATION_REGEN_INTERVAL_MS
+    await stream.close()
     for (let xp = 24; xp <= 32; xp++) expect((await feed()).fish.experience).toBe(xp)
     expect(await feed()).toMatchObject({
       remainingRations: 10, fish: { experience: 33, level: 18, stage: 'emperor', size: 275, unspentPoints: 17 },
@@ -604,29 +806,9 @@ describe('SQLite API', () => {
 
   it('SSE 连接推送下水、更新、进食、归档和隐藏事件', async () => {
     const { cookie } = await register('观测者')
-    const response = await request('/events')
-    expect(response.headers.get('content-type')).toContain('text/event-stream')
-    const reader = response.body!.getReader()
-    const decoder = new TextDecoder()
-    let buffered = ''
-
-    async function event(name: string) {
-      for (;;) {
-        const boundary = buffered.indexOf('\n\n')
-        if (boundary < 0) {
-          const chunk = await reader.read()
-          if (chunk.done) throw new Error(`Event ${name} missing`)
-          buffered += decoder.decode(chunk.value)
-          continue
-        }
-        const entry = buffered.slice(0, boundary)
-        buffered = buffered.slice(boundary + 2)
-        if (entry.includes(`event: ${name}\n`)) return JSON.parse(entry.match(/^data: (.*)$/m)![1]) as object
-      }
-    }
+    const { event, close } = await openEvents()
 
     try {
-      await event('ready')
       const fish = await release(cookie, '光谱')
       expect(await event('fish_released')).toMatchObject({ fish: { id: fish.id } })
       const pellet = await drop(cookie)
@@ -667,7 +849,7 @@ describe('SQLite API', () => {
         kind: 'golden_feast', text: `👑 ${goldenFish.name} 一口吞下黄金大餐，直接撑翻了！`, fishId: goldenFish.id, createdAt: time,
       })
     } finally {
-      await reader.cancel()
+      await close()
     }
   })
 })

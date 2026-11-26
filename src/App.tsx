@@ -1,6 +1,6 @@
 import { useEffect, useEffectEvent, useRef, useState } from 'react'
-import type { Fish, FishRelease, GoldenFeast, GoldenFeastClaim, KeeperResponse, TankEvents, TankTicker } from '../shared/contracts'
-import { DAILY_RATION_LIMIT, PELLET_LIFETIME_MS, TANK_VIEW_LIMIT, getBellyState, type FeedOutcome } from '../shared/domain'
+import type { Fish, FishRelease, GoldenFeast, GoldenFeastClaim, KeeperResponse, RationState, TankEvents, TankTicker } from '../shared/contracts'
+import { MAX_RATIONS, PELLET_LIFETIME_MS, TANK_VIEW_LIMIT, getBellyState, type FeedOutcome } from '../shared/domain'
 import { api } from './api'
 import { playSound, setSoundMuted, unlockSound } from './audio/sound'
 import { Icon } from './icons'
@@ -13,7 +13,7 @@ import type { TideMode } from './tank/ambient'
 import type { CollisionEvent } from './tank/physics'
 
 const unloaded: KeeperResponse = { keeper: null }
-const dailyRations = DAILY_RATION_LIMIT
+const emptyJar = '鱼食已用完，留在页面每分钟恢复 1 颗'
 const soundKey = 'fish-sound-muted'
 const tideKey = 'fish-tide-mode'
 const tideModes: TideMode[] = ['auto', 'dawn', 'day', 'dusk', 'night']
@@ -39,7 +39,9 @@ export function App() {
   const [fish, setFish] = useState<Fish[]>([])
   const [loaded, setLoaded] = useState(false)
   const [keeper, setKeeper] = useState<KeeperResponse>(unloaded)
-  const [rations, setRations] = useState(dailyRations)
+  const [rations, setRations] = useState(MAX_RATIONS)
+  const [nextRationInSec, setNextRationInSec] = useState(0)
+  const [streamConnected, setStreamConnected] = useState(false)
   const [studio, setStudio] = useState(false)
   const [identity, setIdentity] = useState<'keeper' | 'food' | 'release' | null>(null)
   const [profileId, setProfileId] = useState(startingFocus)
@@ -57,7 +59,9 @@ export function App() {
   const [ticker, setTicker] = useState<TankTicker | null>(null)
   const [goldenFeast, setGoldenFeast] = useState<GoldenFeast | null>(null)
   const [tideMode, setTideMode] = useState<TideMode>(savedTide)
+  const keeperId = keeper.keeper?.id
 
+  const nextRationDeadline = useRef(0)
   const pellets = useRef(new Map<string, LocalPellet>())
   const localDrops = useRef(new Map<string, number>())
   const effects = useRef<TankEffect[]>([])
@@ -76,13 +80,25 @@ export function App() {
   const searchBox = useRef<HTMLDivElement>(null)
   const ownIndex = useRef(0)
 
+  function updateRations(state: RationState) {
+    nextRationDeadline.current = performance.now() + state.nextRationInSec * 1000
+    setRations(state.remainingRations)
+    setNextRationInSec(state.nextRationInSec)
+  }
+
   async function refreshKeeper() {
     const request = ++keeperRequest.current
     const state = await api.keeper()
     if (request !== keeperRequest.current) return
-    ownerId.current = state.keeper?.id
+    const id = state.keeper?.id
+    if (ownerId.current && ownerId.current !== id) {
+      waterEpoch.current++
+      pellets.current.clear()
+      setFeeding(false)
+    }
+    ownerId.current = id
     setKeeper(state)
-    setRations(state.keeper ? state.remainingRations : dailyRations)
+    updateRations(state.keeper ? state : { remainingRations: MAX_RATIONS, nextRationInSec: 0 })
   }
 
   async function loadView(nextFocus: string, exclude: string[] = []) {
@@ -121,11 +137,17 @@ export function App() {
     defocus.current = window.setTimeout(() => setSpotlight(''), 7000)
   }
 
+  async function cancelPellet(id: string) {
+    const owner = ownerId.current
+    const state = await api.cancel(id)
+    if (owner === ownerId.current) updateRations(state)
+  }
+
   function cancelPellets() {
     waterEpoch.current++
     const previous = [...pellets.current.keys()]
     pellets.current.clear()
-    return Promise.allSettled(previous.map(api.cancel))
+    return Promise.allSettled(previous.map(cancelPellet))
   }
 
   async function moveView(id = '', shuffle = false) {
@@ -196,19 +218,21 @@ export function App() {
     if (!canFeedView()) return
     if (!keeper.keeper) { setFeeding(false); setIdentity('food'); return }
     if (rations - dropping.current <= 0) {
-      setToast('今天的投喂配额已用完')
+      setToast(emptyJar)
       return
     }
     unlockSound()
     dropping.current++
+    const owner = keeper.keeper.id
     const epoch = waterEpoch.current
     const started = Date.now()
     try {
       const item = await api.drop(x, y)
-      setRations(item.remainingRations)
+      if (owner !== ownerId.current) return
+      updateRations(item)
       localDrops.current.set(item.pelletId, started + PELLET_LIFETIME_MS + 25_000)
       if (epoch !== waterEpoch.current) {
-        await api.cancel(item.pelletId)
+        await cancelPellet(item.pelletId)
         return
       }
       pellets.current.set(item.pelletId, {
@@ -228,8 +252,10 @@ export function App() {
     const pellet = pellets.current.get(id)
     if (!pellet || pellet.busy || pellet.expiresAt <= Date.now()) return
     pellet.busy = true
+    const owner = ownerId.current
     try {
       const result = await api.claim(id, fishId)
+      if (owner === ownerId.current) updateRations(result)
       const stillHere = pellets.current.delete(id)
       applyFish(result.fish)
       if (stillHere) {
@@ -310,34 +336,60 @@ export function App() {
     void refreshKeeper().catch(() => {})
   }
 
-  const setup = useEffectEvent(() => {
-    let ready = false
-    const eventSource = new EventSource('/api/events')
-    function on<K extends keyof TankEvents>(name: K, consume: (data: TankEvents[K]) => void) {
-      eventSource.addEventListener(name, (event: MessageEvent<string>) => {
-        try { consume(JSON.parse(event.data) as TankEvents[K]) } catch { /* Ignore malformed stream messages. */ }
+  const setupEvents = useEffectEvent((id: string | undefined) => {
+    function connect() {
+      const eventSource = new EventSource('/api/events')
+      function on<K extends keyof TankEvents>(name: K, consume: (data: TankEvents[K]) => void) {
+        eventSource.addEventListener(name, (event: MessageEvent<string>) => {
+          try { consume(JSON.parse(event.data) as TankEvents[K]) } catch { /* Ignore malformed stream messages. */ }
+        })
+      }
+      eventSource.addEventListener('ready', () => {
+        setStreamConnected(true)
+        void loadView(focus.current, requestedExclusions.current).catch(error => setToast(errorMessage(error)))
+        void refreshKeeper().catch(() => {})
       })
+      eventSource.addEventListener('error', () => setStreamConnected(false))
+      on('fish_released', ({ fish }) => applyFish(fish, true))
+      on('fish_archived', ({ fishId }) => removeFish(fishId))
+      on('fish_hidden', ({ fishId }) => removeFish(fishId))
+      on('fish_updated', ({ fish }) => applyFish(fish))
+      on('pellet_consumed', ({ pelletId, fish, outcome }) => {
+        applyFish(fish)
+        if (!localDrops.current.has(pelletId)) enqueueEffect({ fishId: fish.id, outcome })
+      })
+      on('golden_feast_spawned', ({ goldenFeast }) => {
+        if (celebratedFeasts.current.has(goldenFeast.id)) return
+        feastVersion.current++
+        setGoldenFeast(goldenFeast)
+      })
+      on('golden_feast_consumed', celebrateFeast)
+      on('tank_ticker', setTicker)
+      on('rations_updated', state => {
+        if (id && ownerId.current === id) updateRations(state)
+      })
+      return eventSource
     }
-    eventSource.addEventListener('ready', () => {
-      void loadView(focus.current, requestedExclusions.current).catch(error => setToast(errorMessage(error)))
-      if (ready) void refreshKeeper().catch(() => {})
-      ready = true
-    })
-    on('fish_released', ({ fish }) => applyFish(fish, true))
-    on('fish_archived', ({ fishId }) => removeFish(fishId))
-    on('fish_hidden', ({ fishId }) => removeFish(fishId))
-    on('fish_updated', ({ fish }) => applyFish(fish))
-    on('pellet_consumed', ({ pelletId, fish, outcome }) => {
-      applyFish(fish)
-      if (!localDrops.current.has(pelletId)) enqueueEffect({ fishId: fish.id, outcome })
-    })
-    on('golden_feast_spawned', ({ goldenFeast }) => {
-      if (celebratedFeasts.current.has(goldenFeast.id)) return
-      feastVersion.current++
-      setGoldenFeast(goldenFeast)
-    })
-    on('golden_feast_consumed', celebrateFeast)
-    on('tank_ticker', setTicker)
+
+    let eventSource = connect()
+    function close() {
+      eventSource.close()
+      setStreamConnected(false)
+    }
+    function restore(event: PageTransitionEvent) {
+      if (event.persisted) eventSource = connect()
+    }
+    window.addEventListener('pagehide', close)
+    window.addEventListener('pageshow', restore)
+    return () => {
+      close()
+      window.removeEventListener('pagehide', close)
+      window.removeEventListener('pageshow', restore)
+    }
+  })
+  useEffect(() => setupEvents(keeperId), [keeperId])
+
+  const setupMaintenance = useEffectEvent(() => {
     void loadView(startingFocus).catch(error => setToast(errorMessage(error)))
     void refreshKeeper().catch(() => {})
 
@@ -366,7 +418,6 @@ export function App() {
     window.addEventListener('pagehide', leave)
     window.addEventListener('pointerdown', unlockSound, { once: true })
     return () => {
-      eventSource.close()
       window.removeEventListener('pagehide', leave)
       window.removeEventListener('pointerdown', unlockSound)
       window.clearInterval(expiry)
@@ -374,7 +425,15 @@ export function App() {
       window.clearTimeout(defocus.current)
     }
   })
-  useEffect(() => setup(), [])
+  useEffect(() => setupMaintenance(), [])
+
+  useEffect(() => {
+    if (!keeperId || !streamConnected || rations >= MAX_RATIONS) return
+    const timer = window.setInterval(() => {
+      setNextRationInSec(Math.max(0, Math.ceil((nextRationDeadline.current - performance.now()) / 1000)))
+    }, 250)
+    return () => window.clearInterval(timer)
+  }, [keeperId, streamConnected, rations])
 
   useEffect(() => {
     setSoundMuted(muted)
@@ -426,8 +485,7 @@ export function App() {
   }, [identity, profileId, immersive, searchOpen, studio, leaderboard])
 
   const profile = fish.find(item => item.id === profileId)
-  const keeperId = keeper.keeper?.id
-  const shownRations = keeper.keeper ? rations : dailyRations
+  const shownRations = keeperId ? rations : MAX_RATIONS
 
   return <>
     <main className="tank-page" hidden={studio}>
@@ -491,13 +549,13 @@ export function App() {
               if (!canFeedView()) return
               unlockSound()
               if (!keeper.keeper) { setIdentity('food'); return }
-              if (!shownRations) { setToast('今天的投喂配额已用完'); return }
+              if (!shownRations) { setToast(emptyJar); return }
               setFeeding(true)
             }}>
             <span className="feed-icon"><Icon name="jar" /></span>
             <span className="feed-label"><strong>{feeding ? '退出投喂模式' : '鱼食罐'}</strong>
-              <small>剩余 {shownRations}/{dailyRations}</small></span>
-            <span className="ration-dots" aria-hidden="true">{Array.from({ length: dailyRations }, (_, index) =>
+              <small>剩余 {shownRations}/{MAX_RATIONS}{keeperId && shownRations < MAX_RATIONS && ` · ${nextRationInSec}s后+1`}</small></span>
+            <span className="ration-dots" aria-hidden="true">{Array.from({ length: MAX_RATIONS }, (_, index) =>
               <i className={index < shownRations ? 'filled' : ''} key={index} />)}</span>
           </button>
           {feeding && <p className="feed-hint" role="status">点击水面撒食</p>}

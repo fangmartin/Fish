@@ -9,7 +9,7 @@ function positiveInt(value: string | undefined, fallback: number) {
   return Number.isSafeInteger(number) && number > 0 ? number : fallback
 }
 
-const { app, db } = createApp({
+const { app, db, pauseRationRegen } = createApp({
   dataDir: resolve(process.env.DATA_DIR ?? 'data'),
   dbPath: process.env.DB_PATH ? resolve(process.env.DB_PATH) : undefined,
   adminSecret: process.env.ADMIN_SECRET,
@@ -34,6 +34,7 @@ const server = serve({
 })
 
 function stop() {
+  pauseRationRegen()
   server.close(() => db.close())
   if ('closeAllConnections' in server) server.closeAllConnections()
 }

@@ -2,9 +2,10 @@ import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type { Fish } from '../shared/contracts'
-import { dailyCount, getBellyState, getDigestIntervalMs, getGrowth, unspentPoints, type FishEye } from '../shared/domain'
+import { MAX_RATIONS, dailyCount, getBellyState, getDigestIntervalMs, getGrowth, unspentPoints, type FishEye } from '../shared/domain'
 
 export type KeeperRow = { id: string; nickname: string; passcode: string }
+export type AfterCommit = (effect: () => void) => void
 export type FishRow = {
   id: string; keeper_id: string; nickname: string; name: string
   is_system: number; is_hidden: number; status: Fish['status']; created_at: number
@@ -36,7 +37,8 @@ export function openStorage(dataDir: string, dbPath: string) {
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
     CREATE TABLE IF NOT EXISTS keepers (
-      id TEXT PRIMARY KEY, nickname TEXT NOT NULL, passcode TEXT UNIQUE, session TEXT UNIQUE
+      id TEXT PRIMARY KEY, nickname TEXT NOT NULL, passcode TEXT UNIQUE, session TEXT UNIQUE,
+      rations INTEGER NOT NULL DEFAULT ${MAX_RATIONS}, ration_progress_ms INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS fish (
       id TEXT PRIMARY KEY, keeper_id TEXT NOT NULL REFERENCES keepers(id), name TEXT NOT NULL,
@@ -78,19 +80,29 @@ export function openStorage(dataDir: string, dbPath: string) {
     UPDATE fish SET is_hidden = 1 WHERE is_system = 1 AND is_hidden = 0;
   `)
 
-  function transaction<T>(work: () => T): T {
+  function transaction<T>(work: (afterCommit: AfterCommit) => T): T {
+    const effects: (() => void)[] = []
+    let result: T
     db.exec('BEGIN IMMEDIATE')
     try {
-      const result = work()
+      result = work(effect => { effects.push(effect) })
       db.exec('COMMIT')
-      return result
     } catch (error) {
       db.exec('ROLLBACK')
       throw error
     }
+    for (const effect of effects) effect()
+    return result
   }
 
   transaction(() => {
+    const keeperColumns = new Set(db.prepare('PRAGMA table_info(keepers)').all().map(column => column.name))
+    if (!keeperColumns.has('rations')) {
+      db.exec(`ALTER TABLE keepers ADD COLUMN rations INTEGER NOT NULL DEFAULT ${MAX_RATIONS}`)
+    }
+    if (!keeperColumns.has('ration_progress_ms')) {
+      db.exec('ALTER TABLE keepers ADD COLUMN ration_progress_ms INTEGER NOT NULL DEFAULT 0')
+    }
     const columns = db.prepare('PRAGMA table_info(pellets)').all()
     if (!columns.some(column => column.name === 'dropped_date')) {
       db.exec('ALTER TABLE pellets ADD COLUMN dropped_date TEXT')

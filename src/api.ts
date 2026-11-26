@@ -1,4 +1,6 @@
-import type { Claim, Fish, FishProfile, FishRelease, GoldenFeastClaim, Keeper, KeeperResponse, Leaderboard, Pellet, TankView } from '../shared/contracts'
+import type {
+  Claim, Fish, FishProfile, FishRelease, GoldenFeastClaim, Keeper, KeeperResponse, Leaderboard, Pellet, RationState, TankView,
+} from '../shared/contracts'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch('/api' + path, init)
@@ -15,8 +17,8 @@ const post = <T>(path: string, body?: object, keepalive?: boolean) => request<T>
 
 export const api = {
   keeper: () => request<KeeperResponse>('/keeper/me'),
-  register: (nickname: string) => post<{ keeper: Keeper }>('/keeper/register', { nickname }),
-  recover: (passcode: string) => post<{ keeper: Keeper }>('/keeper/recover', { passcode }),
+  register: (nickname: string) => post<{ keeper: Keeper } & RationState>('/keeper/register', { nickname }),
+  recover: (passcode: string) => post<{ keeper: Keeper } & RationState>('/keeper/recover', { passcode }),
   nickname: (nickname: string) => post<{ keeper: Keeper }>('/keeper/nickname', { nickname }),
   tank: (focus: string, exclude: string[] = []) => request<TankView>(
     '/tank/view?' + new URLSearchParams({ focusFishId: focus, excludeIds: exclude.join(',') }),
@@ -32,7 +34,7 @@ export const api = {
   report: (id: string) => post<{ hidden: boolean }>(`/fish/${encodeURIComponent(id)}/report`),
   drop: (x: number, y: number) => post<Pellet>('/pellets/drop', { x, y }),
   claim: (id: string, winnerFishId: string) => post<Claim>(`/pellets/${id}/claim`, { winnerFishId }),
-  cancel: (id: string) => post<{ remainingRations: number }>(`/pellets/${id}/cancel`, undefined, true),
+  cancel: (id: string) => post<RationState>(`/pellets/${id}/cancel`, undefined, true),
   leaderboard: (signal: AbortSignal) => request<Leaderboard>('/tank/leaderboard', { signal }),
   knockout: (attackerFishId: string, victimFishId: string) => post<{ fish: Fish }>('/tank/knockout', { attackerFishId, victimFishId }),
   claimFeast: (id: string, winnerFishId: string) => post<GoldenFeastClaim>(`/golden-feast/${id}/claim`, { winnerFishId }),

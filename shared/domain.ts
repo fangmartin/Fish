@@ -1,4 +1,5 @@
-export const DAILY_RATION_LIMIT = 20
+export const MAX_RATIONS = 20
+export const RATION_REGEN_INTERVAL_MS = 60_000
 export const MAX_ACTIVE_FISH_PER_KEEPER = 3
 export const TANK_VIEW_LIMIT = 35
 export const REPORT_HIDE_THRESHOLD = 3
@@ -79,8 +80,32 @@ export function dailyCount(count: number, recordedDate: string | null, nowMs: nu
   return recordedDate === shanghaiDate(nowMs) ? count : 0
 }
 
-export function remainingRations(droppedCount: number) {
-  return Math.max(0, DAILY_RATION_LIMIT - droppedCount)
+function clampRations(rations: number) {
+  return Math.min(MAX_RATIONS, Math.max(0, Math.floor(rations)))
+}
+
+export function settleOnlineRations(rations: number, progressMs: number, elapsedOnlineMs: number) {
+  const current = clampRations(rations)
+  if (current === MAX_RATIONS) return { rations: MAX_RATIONS, progressMs: 0, gained: 0, nextRationInSec: 0 }
+  const totalMs = Math.max(0, Math.floor(progressMs)) + Math.max(0, Math.floor(elapsedOnlineMs))
+  const gained = Math.min(MAX_RATIONS - current, Math.floor(totalMs / RATION_REGEN_INTERVAL_MS))
+  const nextRations = current + gained
+  const full = nextRations === MAX_RATIONS
+  const nextProgressMs = full ? 0 : totalMs % RATION_REGEN_INTERVAL_MS
+  return {
+    rations: nextRations, progressMs: nextProgressMs, gained,
+    nextRationInSec: full ? 0 : Math.ceil((RATION_REGEN_INTERVAL_MS - nextProgressMs) / 1000),
+  }
+}
+
+export function consumeRation(rations: number, progressMs: number) {
+  const current = clampRations(rations)
+  if (!current) return null
+  const nextProgressMs = current === MAX_RATIONS ? 0 : progressMs
+  return {
+    rations: current - 1, progressMs: nextProgressMs,
+    nextRationInSec: Math.ceil((RATION_REGEN_INTERVAL_MS - nextProgressMs) / 1000),
+  }
 }
 
 export type GrowthStage = 'fry' | 'juvenile' | 'adult' | 'leviathan' | 'emperor'
