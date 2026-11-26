@@ -1,0 +1,74 @@
+import type { FeedOutcome, GrowthStage, Stats, StuffedStacks } from './domain'
+
+export interface Fish {
+  id: string
+  keeperId: string
+  nickname: string
+  name: string
+  assetUrl: string
+  isSystem: boolean
+  isHidden: boolean
+  status: 'active' | 'archived'
+  createdAt: number
+  experience: number
+  level: number
+  stage: GrowthStage
+  progress: number
+  nextLevelXp: number
+  size: number
+  stats: Stats
+  unspentPoints: number
+  lastRespecDate: string | null
+  dailyFedCount: number
+  dailyFedDate: string | null
+  rawStuffedStacks: number
+  stuffedStacks: StuffedStacks
+  stuffedUpdatedAt: number
+  digestionRemainingSec: number
+  serverNow: number
+}
+
+export interface FeedingRecord {
+  consumedAt: number
+  outcome: FeedOutcome
+}
+
+export interface FishProfile extends Fish {
+  feedingHistory: FeedingRecord[]
+}
+
+export interface Keeper {
+  id: string
+  nickname: string
+  passcode: string
+}
+
+export type KeeperResponse = { keeper: null } | {
+  keeper: Keeper
+  remainingRations: number
+  activeFish: Fish[]
+  archivedFish: Fish[]
+}
+
+export interface Pellet {
+  pelletId: string
+  x: number
+  y: number
+  expiresAt: number
+  remainingRations: number
+}
+
+export interface Claim {
+  outcome: FeedOutcome
+  fish: Fish
+  remainingRations: number
+  levelDelta: number
+}
+
+export interface TankEvents {
+  fish_released: { fish: Fish }
+  fish_archived: { fishId: string }
+  fish_hidden: { fishId: string }
+  fish_updated: { fish: Fish }
+  pellet_consumed: { pelletId: string; fish: Fish; outcome: FeedOutcome; levelDelta: number }
+}

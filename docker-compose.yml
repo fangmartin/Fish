@@ -1,0 +1,20 @@
+services:
+  fish:
+    image: registry.cn-hangzhou.aliyuncs.com/martin-aigc/fish:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: draw-and-raise-fish
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      PORT: "3000"
+      HOST: "0.0.0.0"
+      DATA_DIR: "/app/data"
+      TZ: "Asia/Shanghai"
+      ADMIN_SECRET: "${ADMIN_SECRET:-}"
+      REGISTER_IP_DAILY_LIMIT: "${REGISTER_IP_DAILY_LIMIT:-8}"
+      DROP_IP_MINUTE_LIMIT: "${DROP_IP_MINUTE_LIMIT:-30}"
+    volumes:
+      - ./data:/app/data
