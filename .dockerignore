@@ -13,5 +13,8 @@ GLOSSARY.md
 README.md
 vitest.config.ts
 docker-compose.yml
+Caddyfile
+caddy_data
+caddy_config
 *.log
 .DS_Store

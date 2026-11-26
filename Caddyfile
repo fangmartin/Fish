@@ -1,0 +1,9 @@
+fangjie.site, fish.fangjie.site {
+	@not_sse {
+		not path /api/events
+	}
+	encode @not_sse zstd gzip
+	reverse_proxy fish:3000 {
+		flush_interval -1
+	}
+}

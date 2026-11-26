@@ -1,13 +1,13 @@
 services:
   fish:
-    image: registry.cn-hangzhou.aliyuncs.com/martin-aigc/fish:latest
+    image: ${FISH_IMAGE:-registry.cn-hangzhou.aliyuncs.com/martin-aigc/fish:latest}
     build:
       context: .
       dockerfile: Dockerfile
     container_name: draw-and-raise-fish
     restart: unless-stopped
-    ports:
-      - "${PORT:-3000}:3000"
+    expose:
+      - "3000"
     environment:
       PORT: "3000"
       HOST: "0.0.0.0"
@@ -18,3 +18,18 @@ services:
       DROP_IP_MINUTE_LIMIT: "${DROP_IP_MINUTE_LIMIT:-30}"
     volumes:
       - ./data:/app/data
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: draw-and-raise-fish-caddy
+    restart: unless-stopped
+    depends_on:
+      - fish
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy_data:/data
+      - ./caddy_config:/config
