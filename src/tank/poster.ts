@@ -3,7 +3,7 @@ import { getBuildTitle, MAX_STAT_VALUE, STAT_KEYS, type StatKey } from '../../sh
 import { drawFishMesh } from './meshRenderer'
 
 export const statNames: Record<StatKey, string> = {
-  burst: '爆发力', stamina: '耐力', sense: '感知力', agility: '灵巧度', brawn: '冲撞力',
+  burst: '爆发力', stamina: '耐力', sense: '感知力', agility: '灵巧度', brawn: '冲撞力', appetite: '胃口',
 }
 
 export async function downloadFishPoster(fish: FishProfile, shareUrl: string) {
@@ -53,7 +53,7 @@ export async function downloadFishPoster(fish: FishProfile, shareUrl: string) {
   label('潮汐鱼缸 · 鱼类档案', 360, 80, 20, '#b5e9e3')
   const size = Math.min(430, 216 * Math.max(1, image.naturalWidth / image.naturalHeight))
   drawFishMesh(ctx, image, image.naturalWidth, image.naturalHeight, {
-    x: 360, y: 229, size, time: 0, eyes: fish.eyes, lookTarget: { x: 140, y: 200 },
+    x: 360, y: 229, size, time: 0, isEmperor: fish.stage === 'emperor', eyes: fish.eyes, lookTarget: { x: 140, y: 200 },
   })
   label(fish.name, 360, 382, 52, '#f1fffc', 578, true)
   if (fish.tagline) label(`「${fish.tagline}」`, 360, 428, 24, '#baf0e5')

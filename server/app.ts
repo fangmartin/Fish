@@ -10,7 +10,8 @@ import type { FeedingRecord, GoldenFeast, TankEvents, TankTicker } from '../shar
 import {
   DAILY_RATION_LIMIT, GOLDEN_FEAST_EVERY_FEEDS, GOLDEN_FEAST_LIFETIME_MS, MAX_ACTIVE_FISH_PER_KEEPER,
   MAX_ART_BYTES, MAX_ART_EDGE, PELLET_LIFETIME_MS, REPORT_HIDE_THRESHOLD, TANK_VIEW_LIMIT,
-  allocateStats, applyGoldenFeast, canRespec, feedFish, getDigestionState, getGrowth, remainingRations, shanghaiDate, validateEyes,
+  allocateStats, applyGoldenFeast, canRespec, feedFish, getBellyCapacity, getBellyState, getDigestIntervalMs,
+  getGrowth, remainingRations, shanghaiDate, validateEyes,
 } from '../shared/domain'
 import { parseArtwork } from './art'
 import { openStorage, presentFish, type FishRow, type KeeperRow } from './storage'
@@ -124,17 +125,17 @@ export function createApp(options: Options) {
 
   function settleFish(row: FishRow, time: number, feed: typeof feedFish | typeof applyGoldenFeast) {
     const next = feed({
-      experience: row.experience, dailyFedCount: row.daily_fed_count, dailyFedDate: row.daily_fed_date,
-      rawStuffedStacks: row.stuffed_stacks, stuffedUpdatedAt: row.stuffed_updated_at,
+      experience: row.experience, appetite: row.appetite,
+      rawBellyLoad: row.belly_load, rawStuffedFull: !!row.belly_full, bellyUpdatedAt: row.belly_updated_at,
     }, time)
     if (!next) fail(409, '这条鱼撑不动了')
     const today = shanghaiDate(time)
-    db.prepare(`UPDATE fish SET experience = ?, daily_fed_count = ?, daily_fed_date = ?,
-      stuffed_stacks = ?, stuffed_updated_at = ?, updated_at = ?,
+    // Growth is capped in the domain. Keep XP earned under the old level curve.
+    const experience = Math.max(row.experience, next.experience)
+    db.prepare(`UPDATE fish SET experience = ?, belly_load = ?, belly_full = ?, belly_updated_at = ?, updated_at = ?,
       daily_eats_count = CASE WHEN daily_eats_date = ? THEN daily_eats_count + 1 ELSE 1 END, daily_eats_date = ?
-      WHERE id = ?`).run(next.experience, next.dailyFedCount, next.dailyFedDate, next.rawStuffedStacks,
-        next.stuffedUpdatedAt, time, today, today, row.id)
-    return { ...next, fish: presentFish(findFish(row.id)!, time) }
+      WHERE id = ?`).run(experience, next.rawBellyLoad, Number(next.rawStuffedFull), next.bellyUpdatedAt, time, today, today, row.id)
+    return { outcome: next.outcome, levelDelta: next.levelDelta, fish: presentFish(findFish(row.id)!, time) }
   }
 
   function issueCookie(c: Context, session: string) {
@@ -164,14 +165,25 @@ export function createApp(options: Options) {
 
   function ensureTankCanEat(time: number) {
     const swimmers = db.prepare(`
-      SELECT stuffed_stacks, stuffed_updated_at FROM fish WHERE status = 'active' AND is_hidden = 0
-    `).iterate() as Iterable<Pick<FishRow, 'stuffed_stacks' | 'stuffed_updated_at'>>
+      SELECT experience, appetite, belly_load, belly_full, belly_updated_at FROM fish WHERE status = 'active' AND is_hidden = 0
+    `).iterate() as Iterable<Pick<FishRow, 'experience' | 'appetite' | 'belly_load' | 'belly_full' | 'belly_updated_at'>>
     let hasFish = false
     for (const fish of swimmers) {
       hasFish = true
-      if (getDigestionState(fish.stuffed_stacks, fish.stuffed_updated_at, time).stuffedStacks < 3) return
+      const level = getGrowth(fish.experience).level
+      if (!getBellyState(fish.belly_load, !!fish.belly_full, fish.belly_updated_at, level, fish.appetite, time).isStuffedFull) return
     }
     fail(409, hasFish ? '鱼缸里的鱼都撑不动了，稍后再喂吧' : '鱼缸里还没有鱼，先画一条下水吧')
+  }
+
+  function adjustBellyForAppetite(fish: FishRow, level: number, appetite: number, time: number) {
+    const belly = getBellyState(fish.belly_load, !!fish.belly_full, fish.belly_updated_at, level, fish.appetite, time)
+    if (belly.isStuffedFull) return
+    const load = Math.min(belly.currentLoad, getBellyCapacity(level, appetite) + 1)
+    const interval = getDigestIntervalMs(level, appetite)
+    const partial = Math.min(time - belly.nextAnchorMs, interval - 1)
+    db.prepare('UPDATE fish SET belly_load = ?, belly_full = 0, belly_updated_at = ? WHERE id = ?')
+      .run(load, time - partial, fish.id)
   }
 
   function ownedFish(id: string, keeper: KeeperRow) {
@@ -412,10 +424,12 @@ export function createApp(options: Options) {
     const time = now()
     const row = transaction(() => {
       const fish = ownedFish(c.req.param('id'), keeper)
-      const next = allocateStats(fish, increments, getGrowth(fish.experience).level)
+      const level = getGrowth(fish.experience).level
+      const next = allocateStats(fish, increments, level)
       if (!next) fail(400, '属性增量、可用点数或单项上限不符')
-      db.prepare('UPDATE fish SET burst = ?, stamina = ?, sense = ?, agility = ?, brawn = ?, updated_at = ? WHERE id = ?')
-        .run(next.burst, next.stamina, next.sense, next.agility, next.brawn, time, fish.id)
+      if (next.appetite !== fish.appetite) adjustBellyForAppetite(fish, level, next.appetite, time)
+      db.prepare('UPDATE fish SET burst = ?, stamina = ?, sense = ?, agility = ?, brawn = ?, appetite = ?, updated_at = ? WHERE id = ?')
+        .run(next.burst, next.stamina, next.sense, next.agility, next.brawn, next.appetite, time, fish.id)
       return findFish(fish.id)!
     })
     const fish = presentFish(row, time)
@@ -429,7 +443,8 @@ export function createApp(options: Options) {
     const row = transaction(() => {
       const fish = ownedFish(c.req.param('id'), keeper)
       if (!canRespec(fish.last_respec_date, time)) fail(409, '今天已经免费洗点过了')
-      db.prepare(`UPDATE fish SET burst = 0, stamina = 0, sense = 0, agility = 0, brawn = 0,
+      adjustBellyForAppetite(fish, getGrowth(fish.experience).level, 0, time)
+      db.prepare(`UPDATE fish SET burst = 0, stamina = 0, sense = 0, agility = 0, brawn = 0, appetite = 0,
         last_respec_date = ?, updated_at = ? WHERE id = ?`).run(shanghaiDate(time), time, fish.id)
       return findFish(fish.id)!
     })
@@ -550,7 +565,10 @@ export function createApp(options: Options) {
       return { feastId, fish, outcome, levelDelta, xpGained: fish.experience - row.experience }
     })
     broadcast('golden_feast_consumed', result)
-    ticker('golden_feast', `👑 ${result.fish.name} 抢走了天降黄金大餐！`, result.fish.id, time)
+    const text = result.outcome === 'stuffed_full'
+      ? `👑 ${result.fish.name} 一口吞下黄金大餐，直接撑翻了！`
+      : `👑 ${result.fish.name} 抢走了天降黄金大餐！`
+    ticker('golden_feast', text, result.fish.id, time)
     return c.json(result)
   })
 

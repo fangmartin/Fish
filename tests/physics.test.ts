@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { EMPTY_STATS, type Stats, type StuffedStacks } from '../shared/domain'
+import { EMPTY_STATS, type BellyOverload, type Stats } from '../shared/domain'
 import { createSwimmer, cruiseSpeed, floorY, knockTank, mouthPosition, stepTank, type CollisionEvent, type Food, type Swimmer } from '../src/tank/physics'
 import { resolveTidePhase } from '../src/tank/ambient'
 
 const water = { width: 960, height: 600 }
-const body = (id: string, stats: Partial<Stats> = {}, stuffedStacks: StuffedStacks = 0, size = 40) => ({
-  id, size, stats: { ...EMPTY_STATS, ...stats }, stuffedStacks,
+const body = (id: string, stats: Partial<Stats> = {}, bellyOverload: BellyOverload = 0, size = 40) => ({
+  id, size, stats: { ...EMPTY_STATS, ...stats }, bellyFillRatio: bellyOverload ? 1 : 0, bellyOverload,
 })
 const pellet = (x: number, y: number): Food => ({ id: 'pellet', x, y, age: 0, claiming: false })
 const simulate = (fish: Swimmer[], food: Food[], seconds: number) => {
@@ -15,9 +15,9 @@ const simulate = (fish: Swimmer[], food: Food[], seconds: number) => {
 describe('公共鱼缸物理', () => {
   it('敲玻璃让半径内的鱼朝反方向逃逸，并跳过撑瘫和半径外的鱼', () => {
     const near = createSwimmer(body('near'), 450, 300, 0, 0)
-    const edge = createSwimmer(body('edge', {}, 2), 820, 300, Math.PI, 0)
+    const edge = createSwimmer(body('edge', {}, 1), 820, 300, Math.PI, 0)
     const outside = createSwimmer(body('outside'), 821, 300, 0, 0)
-    const full = createSwimmer(body('full', {}, 3), 480, 300, 0, 0)
+    const full = createSwimmer(body('full', {}, 2), 480, 300, 0, 0)
     near.targetId = 'pellet'
     near.sprinting = true
     const group = [near, edge, outside, full]
@@ -43,24 +43,40 @@ describe('公共鱼缸物理', () => {
     expect(scout.alertTimer).toBeCloseTo(0.63)
   })
 
-  it('3 层鱼慢速漂浮，鱼嘴接触鱼食时也无法吃食', () => {
-    const fish = createSwimmer(body('full', { sense: 6, burst: 6 }, 3), 285, 260, 0, 0)
+  it('撑翻的鱼以四分之一速度漂浮，鱼嘴接触鱼食时也无法追食或吃食', () => {
+    const fish = createSwimmer(body('full', { sense: 6, burst: 6 }, 2), 285, 260, 0, 0)
+    fish.targetId = 'pellet'
+    fish.sprinting = true
     const mouth = mouthPosition(fish, water)
-    const food = pellet(mouth.x, mouth.y)
-    expect(stepTank([fish], [food], water, 1 / 60)).toEqual([])
+    const food = { ...pellet(mouth.x, mouth.y), age: 1 }
+    expect(stepTank([fish], [food], water, 0)).toEqual([])
+    expect(fish.targetId).toBeNull()
+    expect(fish.sprinting).toBe(false)
+    const awake = createSwimmer(body('awake'), 285, 260, 0, 0)
+    expect(stepTank([awake], [food], water, 0)).toEqual([{ pelletId: food.id, fishId: 'awake' }])
     simulate([fish], [food], 0.8)
     expect(fish.targetId).toBeNull()
     expect(fish.sprinting).toBe(false)
+    expect(fish.x).toBeGreaterThan(285)
     expect(fish.speed).toBeCloseTo(cruiseSpeed(body('base')) * 0.25)
   })
 
-  it('吃撑 1～2 层实际降低移速与转向', () => {
-    const fish = [0, 1, 2].map(stacks => createSwimmer(body(String(stacks), {}, stacks as StuffedStacks), 450, 250, 0, 1.1))
+  it('饱腹 55% 前保持满速，之后逐渐减速，微撑进一步降低移速与转向', () => {
+    const bodies = [0, 0.4, 0.55, 0.775, 1].map(bellyFillRatio => ({
+      ...body(String(bellyFillRatio)), bellyFillRatio,
+    }))
+    bodies.push(body('overloaded', {}, 1))
+    const fish = bodies.map(item => createSwimmer(item, 450, 250, 0, 1.1))
     for (const item of fish) simulate([item], [], 0.6)
-    expect(fish[1].speed / fish[0].speed).toBeCloseTo(0.65)
-    expect(fish[2].speed / fish[0].speed).toBeCloseTo(0.3)
-    const turn = [0, 1, 2].map(stacks => createSwimmer(body(String(stacks), {}, stacks as StuffedStacks), 450, 250, 0, 0))
+    const [hungry, half, threshold, satisfied, full, overloaded] = fish
+    expect(half.speed).toBeCloseTo(hungry.speed)
+    expect(threshold.speed).toBeCloseTo(hungry.speed)
+    expect(satisfied.speed / hungry.speed).toBeCloseTo(0.84)
+    expect(full.speed / hungry.speed).toBeCloseTo(0.68)
+    expect(overloaded.speed / hungry.speed).toBeCloseTo(0.45)
+    const turn = bodies.slice(2).map(item => createSwimmer(item, 450, 250, 0, 0))
     for (const item of turn) { item.targetId = 'pellet'; simulate([item], [pellet(449, 360)], 0.16) }
+    expect(Math.abs(turn[3].heading)).toBeLessThan(Math.abs(turn[2].heading))
     expect(Math.abs(turn[2].heading)).toBeLessThan(Math.abs(turn[1].heading))
     expect(Math.abs(turn[1].heading)).toBeLessThan(Math.abs(turn[0].heading))
   })
@@ -122,9 +138,9 @@ describe('公共鱼缸物理', () => {
     expect(powerful.sprinting).toBe(false)
   })
 
-  it('两条 260 像素大鱼相距 200 像素时可以发生追食冲撞', () => {
-    const attacker = createSwimmer(body('attacker', { brawn: 6 }, 0, 260), 400, 300, 0, 0)
-    const peer = createSwimmer(body('peer', {}, 0, 260), 600, 300, 0, 0)
+  it('两条 275 像素大鱼相距 200 像素时可以发生追食冲撞', () => {
+    const attacker = createSwimmer(body('attacker', { brawn: 6 }, 0, 275), 400, 300, 0, 0)
+    const peer = createSwimmer(body('peer', {}, 0, 275), 600, 300, 0, 0)
     attacker.targetId = peer.targetId = 'pellet'
     const hits: CollisionEvent[] = []
 
@@ -161,8 +177,8 @@ describe('公共鱼缸物理', () => {
   it('一颗鱼食让水域各处还能吃的鱼一起转向并冲刺', () => {
     const near = createSwimmer(body('near'), 358, 400, 0, 0)
     const far = createSwimmer(body('far'), 75, 400, 0, 0)
-    const across = createSwimmer(body('across', {}, 2), 880, 380, Math.PI, 0)
-    const full = createSwimmer(body('full', {}, 3), 380, 430, 0, 0)
+    const across = createSwimmer(body('across', {}, 1), 880, 380, Math.PI, 0)
+    const full = createSwimmer(body('full', {}, 2), 380, 430, 0, 0)
     const fish = [near, far, across, full]
     const food = pellet(400, 400)
     expect(stepTank(fish, [food], water, 1 / 60)).toEqual([])
@@ -180,7 +196,7 @@ describe('公共鱼缸物理', () => {
   })
 
   it('沉底鱼食可由上方鱼接近并吃掉', () => {
-    for (const size of [40, 150, 260]) {
+    for (const size of [40, 150, 275]) {
       const fish = createSwimmer(body('chaser', {}, 0, size), 450, 388, 0, 0)
       const food = pellet(452, floorY(water))
       let winner: string | undefined

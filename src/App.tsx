@@ -1,6 +1,6 @@
 import { useEffect, useEffectEvent, useRef, useState } from 'react'
 import type { Fish, FishRelease, GoldenFeast, GoldenFeastClaim, KeeperResponse, TankEvents, TankTicker } from '../shared/contracts'
-import { DAILY_RATION_LIMIT, PELLET_LIFETIME_MS, TANK_VIEW_LIMIT, getDigestionState } from '../shared/domain'
+import { DAILY_RATION_LIMIT, PELLET_LIFETIME_MS, TANK_VIEW_LIMIT, getBellyState, type FeedOutcome } from '../shared/domain'
 import { api } from './api'
 import { playSound, setSoundMuted, unlockSound } from './audio/sound'
 import { Icon } from './icons'
@@ -18,6 +18,7 @@ const soundKey = 'fish-sound-muted'
 const tideKey = 'fish-tide-mode'
 const tideModes: TideMode[] = ['auto', 'dawn', 'day', 'dusk', 'night']
 const tideLabels: Record<TideMode, string> = { auto: '自动昼夜', dawn: '清晨', day: '午后', dusk: '黄昏', night: '深夜' }
+const feedingSounds = { leveled_up: 'level', grew: 'eat', fed: 'eat', stuffed: 'burp', stuffed_full: 'burp' } as const satisfies Record<FeedOutcome, string>
 const startingFocus = new URLSearchParams(window.location.search).get('fish') ?? ''
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : '暂时无法连接鱼缸'
 
@@ -183,7 +184,8 @@ export function App() {
 
   function canFeedView(currentFish = fish) {
     const now = Date.now()
-    if (currentFish.some(item => getDigestionState(item.rawStuffedStacks, item.stuffedUpdatedAt, now).stuffedStacks < 3)) {
+    if (currentFish.some(item => !getBellyState(item.rawBellyLoad, item.rawStuffedFull,
+      item.bellyUpdatedAt, item.level, item.stats.appetite, now).isStuffedFull)) {
       return true
     }
     setToast(currentFish.length ? '这片水域的鱼都撑不动了，换片水域或稍后再喂吧' : '鱼缸里还没有鱼，先画一条下水吧')
@@ -232,7 +234,7 @@ export function App() {
       applyFish(result.fish)
       if (stillHere) {
         enqueueEffect({ fishId, outcome: result.outcome })
-        playSound(result.outcome === 'leveled_up' ? 'level' : result.outcome === 'grew' ? 'eat' : 'burp')
+        playSound(feedingSounds[result.outcome])
       }
       void refreshKeeper().catch(() => {})
     } catch {

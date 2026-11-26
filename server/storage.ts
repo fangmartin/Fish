@@ -2,25 +2,29 @@ import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type { Fish } from '../shared/contracts'
-import { dailyCount, getDigestionState, getGrowth, unspentPoints, type FishEye } from '../shared/domain'
+import { dailyCount, getBellyState, getDigestIntervalMs, getGrowth, unspentPoints, type FishEye } from '../shared/domain'
 
 export type KeeperRow = { id: string; nickname: string; passcode: string }
 export type FishRow = {
   id: string; keeper_id: string; nickname: string; name: string
   is_system: number; is_hidden: number; status: Fish['status']; created_at: number
-  experience: number; burst: number; stamina: number; sense: number; agility: number; brawn: number
-  last_respec_date: string | null; daily_fed_count: number; daily_fed_date: string | null
-  stuffed_stacks: number; stuffed_updated_at: number
+  experience: number; burst: number; stamina: number; sense: number; agility: number; brawn: number; appetite: number
+  last_respec_date: string | null
+  belly_load: number; belly_full: number; belly_updated_at: number
   eyes_json: string; tagline: string; daily_eats_count: number; daily_eats_date: string | null
   total_knockouts: number
 }
 
-const funColumns = {
+const fishColumnDefinitions = {
   eyes_json: "TEXT NOT NULL DEFAULT '[]'",
   tagline: "TEXT NOT NULL DEFAULT ''",
   daily_eats_count: 'INTEGER NOT NULL DEFAULT 0',
   daily_eats_date: 'TEXT',
   total_knockouts: 'INTEGER NOT NULL DEFAULT 0',
+  appetite: 'INTEGER NOT NULL DEFAULT 0',
+  belly_load: 'INTEGER NOT NULL DEFAULT 0',
+  belly_full: 'INTEGER NOT NULL DEFAULT 0',
+  belly_updated_at: 'INTEGER NOT NULL DEFAULT 0',
 }
 
 export function openStorage(dataDir: string, dbPath: string) {
@@ -94,8 +98,11 @@ export function openStorage(dataDir: string, dbPath: string) {
     db.exec(`CREATE INDEX IF NOT EXISTS pellet_drop_date
       ON pellets(keeper_id, COALESCE(dropped_date, consumed_date))`)
     const fishColumns = new Set(db.prepare('PRAGMA table_info(fish)').all().map(column => column.name))
-    for (const [name, definition] of Object.entries(funColumns)) {
+    for (const [name, definition] of Object.entries(fishColumnDefinitions)) {
       if (!fishColumns.has(name)) db.exec(`ALTER TABLE fish ADD COLUMN ${name} ${definition}`)
+    }
+    if (!fishColumns.has('belly_full')) {
+      db.exec(`UPDATE fish SET belly_full = 1, belly_updated_at = stuffed_updated_at WHERE stuffed_stacks >= 3`)
     }
     if (!fishColumns.has('daily_eats_date')) {
       db.exec(`
@@ -119,17 +126,22 @@ export function openStorage(dataDir: string, dbPath: string) {
 }
 
 export function presentFish(row: FishRow, nowMs: number): Fish {
-  const stats = { burst: row.burst, stamina: row.stamina, sense: row.sense, agility: row.agility, brawn: row.brawn }
+  const stats = {
+    burst: row.burst, stamina: row.stamina, sense: row.sense, agility: row.agility, brawn: row.brawn, appetite: row.appetite,
+  }
   const growth = getGrowth(row.experience)
+  const rawStuffedFull = !!row.belly_full
+  const { bellyUsed, bellyCapacity, bellyFillRatio, bellyOverload, isStuffedFull, digestionRemainingSec } =
+    getBellyState(row.belly_load, rawStuffedFull, row.belly_updated_at, growth.level, stats.appetite, nowMs)
   return {
     id: row.id, keeperId: row.keeper_id, nickname: row.nickname, name: row.name, status: row.status,
     tagline: row.tagline, eyes: JSON.parse(row.eyes_json) as FishEye[],
     isHidden: !!row.is_hidden, isSystem: !!row.is_system, createdAt: row.created_at, experience: row.experience,
     assetUrl: `/api/assets/fish/${row.id}.png`, ...growth, stats,
     unspentPoints: unspentPoints(growth.level, stats), lastRespecDate: row.last_respec_date,
-    dailyFedCount: dailyCount(row.daily_fed_count, row.daily_fed_date, nowMs), dailyFedDate: row.daily_fed_date,
     dailyEatsCount: dailyCount(row.daily_eats_count, row.daily_eats_date, nowMs), totalKnockouts: row.total_knockouts,
-    rawStuffedStacks: row.stuffed_stacks, stuffedUpdatedAt: row.stuffed_updated_at, serverNow: nowMs,
-    ...getDigestionState(row.stuffed_stacks, row.stuffed_updated_at, nowMs),
+    rawBellyLoad: row.belly_load, rawStuffedFull, bellyUpdatedAt: row.belly_updated_at, serverNow: nowMs,
+    bellyUsed, bellyCapacity, bellyFillRatio, bellyOverload, isStuffedFull, digestionRemainingSec,
+    digestIntervalSec: getDigestIntervalMs(growth.level, stats.appetite) / 1000,
   }
 }

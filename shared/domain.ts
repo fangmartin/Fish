@@ -1,10 +1,10 @@
-export const DAILY_RATION_LIMIT = 10
+export const DAILY_RATION_LIMIT = 20
 export const MAX_ACTIVE_FISH_PER_KEEPER = 3
 export const TANK_VIEW_LIMIT = 35
-export const DAILY_SATIETY_CAP = 6
 export const REPORT_HIDE_THRESHOLD = 3
-export const MAX_LEVEL = 11
-export const MAX_EXPERIENCE = 55
+export const LEVEL_XP_COSTS = [1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3] as const
+export const MAX_LEVEL = LEVEL_XP_COSTS.length + 1
+export const MAX_EXPERIENCE = LEVEL_XP_COSTS.reduce<number>((total, cost) => total + cost, 0)
 export const MAX_STAT_VALUE = 6
 export const MIN_ART_PIXELS = 24
 export const MAX_ART_EDGE = 512
@@ -38,12 +38,19 @@ export function validateEyes(input: unknown): FishEye[] | null {
   return eyes
 }
 
-export const STAT_KEYS = ['burst', 'stamina', 'sense', 'agility', 'brawn'] as const
+export const STAT_KEYS = ['burst', 'stamina', 'sense', 'agility', 'brawn', 'appetite'] as const
 export type StatKey = typeof STAT_KEYS[number]
 export type Stats = Record<StatKey, number>
-export const EMPTY_STATS: Readonly<Stats> = { burst: 0, stamina: 0, sense: 0, agility: 0, brawn: 0 }
+export const EMPTY_STATS: Readonly<Stats> = { burst: 0, stamina: 0, sense: 0, agility: 0, brawn: 0, appetite: 0 }
 const buildTitles: Record<StatKey, string> = {
-  burst: '深海鱼雷', stamina: '永动机', sense: '顺风耳', agility: '深海泥鳅', brawn: '全缸恶霸',
+  burst: '深海鱼雷', stamina: '永动机', sense: '顺风耳', agility: '深海泥鳅', brawn: '全缸恶霸', appetite: '深海无底洞',
+}
+const doubleBuildTitles: Partial<Record<string, string>> = {
+  'brawn+appetite': '霸王餐恶霸',
+  'burst+appetite': '深海吸尘器',
+  'sense+appetite': '干饭雷达',
+  'burst+brawn': '深海泥头车',
+  'burst+agility': '水中幽灵',
 }
 
 export function getBuildTitle(stats: Stats, level: number) {
@@ -51,7 +58,11 @@ export function getBuildTitle(stats: Stats, level: number) {
   if (!highest && level === 1) return '初生萌鱼'
   const leaders = STAT_KEYS.filter(key => stats[key] === highest)
   if (leaders.length === 1) return buildTitles[leaders[0]]
-  return level === MAX_LEVEL ? '深海全能王' : '全能游侠'
+  if (highest > 0 && leaders.length === 2) {
+    const title = doubleBuildTitles[leaders.join('+')]
+    if (title) return title
+  }
+  return level === MAX_LEVEL ? '六边形战神' : '全能游侠'
 }
 
 const shanghai = new Intl.DateTimeFormat('en-CA', {
@@ -72,18 +83,19 @@ export function remainingRations(droppedCount: number) {
   return Math.max(0, DAILY_RATION_LIMIT - droppedCount)
 }
 
-export type GrowthStage = 'fry' | 'juvenile' | 'adult' | 'leviathan'
+export type GrowthStage = 'fry' | 'juvenile' | 'adult' | 'leviathan' | 'emperor'
 
 export function getGrowth(experience: number) {
   const xp = Math.max(0, Math.min(MAX_EXPERIENCE, experience))
   let level = 1
   let progress = xp
-  while (level < MAX_LEVEL && progress >= level) {
-    progress -= level
+  while (level < MAX_LEVEL && progress >= LEVEL_XP_COSTS[level - 1]) {
+    progress -= LEVEL_XP_COSTS[level - 1]
     level++
   }
-  const stage: GrowthStage = level <= 2 ? 'fry' : level <= 5 ? 'juvenile' : level <= 9 ? 'adult' : 'leviathan'
-  return { level, stage, progress, nextLevelXp: level === MAX_LEVEL ? 0 : level, size: 40 + 220 * xp / MAX_EXPERIENCE }
+  const stage: GrowthStage = level <= 3 ? 'fry' : level <= 7 ? 'juvenile'
+    : level <= 11 ? 'adult' : level <= 16 ? 'leviathan' : 'emperor'
+  return { level, stage, progress, nextLevelXp: level === MAX_LEVEL ? 0 : LEVEL_XP_COSTS[level - 1], size: 40 + 235 * xp / MAX_EXPERIENCE }
 }
 
 export function unspentPoints(level: number, stats: Stats) {
@@ -110,58 +122,137 @@ export function canRespec(lastRespecDate: string | null, nowMs: number) {
   return lastRespecDate !== shanghaiDate(nowMs)
 }
 
-export const STUFFED_MOVEMENT = [1, 0.65, 0.3, 0.25] as const
-export type StuffedStacks = 0 | 1 | 2 | 3
-const DIGEST_LAYER_MS = 1_200_000
-const DIGEST_FULL_MS = 3_600_000
+export const BASE_BELLY_BY_LEVEL = [2, 3, 4, 5, 6, 7, 9, 11, 13, 15, 17, 19, 22, 25, 28, 31, 34, 38] as const
+export const APPETITE_CAPACITY_BONUS = 2
 
-export function getDigestionState(rawStacks: number, stuffedUpdatedAt: number, nowMs: number) {
-  const elapsed = Math.max(0, nowMs - stuffedUpdatedAt)
-  if (rawStacks >= 3 && elapsed < DIGEST_FULL_MS) {
-    return { stuffedStacks: 3 as const, digestionRemainingSec: Math.ceil((DIGEST_FULL_MS - elapsed) / 1000) }
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value))
+}
+
+function clampLevel(level: number) {
+  return clamp(Math.floor(level), 1, MAX_LEVEL)
+}
+
+function clampAppetite(appetite: number) {
+  return clamp(appetite, 0, MAX_STAT_VALUE)
+}
+
+export function getBellyCapacity(level: number, appetite = 0) {
+  return BASE_BELLY_BY_LEVEL[clampLevel(level) - 1] + clampAppetite(appetite) * APPETITE_CAPACITY_BONUS
+}
+
+export function getDigestIntervalMs(level: number, appetite = 0) {
+  const baseSec = 120 - (clampLevel(level) - 1) * 6
+  return Math.max(8, Math.round(baseSec * (1 - clampAppetite(appetite) * 0.08))) * 1000
+}
+
+export function getStuffedComaMs(level: number, appetite = 0) {
+  const baseSec = 240 - (clampLevel(level) - 1) * 10
+  return Math.max(25, Math.round(baseSec * (1 - clampAppetite(appetite) * 0.08))) * 1000
+}
+
+export function getGoldenFeastBellyCost(capacity: number) {
+  return Math.max(4, Math.ceil(capacity * 0.35))
+}
+
+export type BellyOverload = 0 | 1 | 2
+
+export function getBellyMovementFactor(bellyFillRatio: number, bellyOverload: BellyOverload) {
+  if (bellyOverload === 2) return 0.25
+  if (bellyOverload === 1) return 0.45
+  if (bellyFillRatio <= 0.55) return 1
+  return 1 - (clamp(bellyFillRatio, 0, 1) - 0.55) / 0.45 * 0.32
+}
+
+export function formatDuration(seconds: number) {
+  const total = Math.max(0, Math.ceil(seconds))
+  if (total < 60) return `${total} 秒`
+  const minutes = Math.floor(total / 60)
+  const remainder = total % 60
+  return remainder === 0 ? `${minutes} 分钟` : `${minutes} 分 ${remainder} 秒`
+}
+
+export function getBellyState(rawBellyLoad: number, rawStuffedFull: boolean, bellyUpdatedAt: number, level: number, appetite: number, nowMs: number) {
+  const elapsed = Math.max(0, nowMs - bellyUpdatedAt)
+  const bellyCapacity = getBellyCapacity(level, appetite)
+  if (rawStuffedFull) {
+    const comaMs = getStuffedComaMs(level, appetite)
+    if (elapsed < comaMs) {
+      return {
+        bellyUsed: bellyCapacity, bellyCapacity, bellyFillRatio: 1, bellyOverload: 2 as const, isStuffedFull: true,
+        digestionRemainingSec: Math.ceil((comaMs - elapsed) / 1000), currentLoad: bellyCapacity + 2, nextAnchorMs: bellyUpdatedAt,
+      }
+    }
   }
-  if (rawStacks === 0 || rawStacks >= 3) return { stuffedStacks: 0 as const, digestionRemainingSec: 0 }
-  const stuffedStacks = Math.max(0, rawStacks - Math.floor(elapsed / DIGEST_LAYER_MS)) as StuffedStacks
+
+  const intervalMs = getDigestIntervalMs(level, appetite)
+  const normalized = rawStuffedFull ? 0 : Math.max(0, Math.floor(rawBellyLoad))
+  const digested = normalized > 0 ? Math.floor(elapsed / intervalMs) : 0
+  const currentLoad = Math.max(0, normalized - digested)
+  const bellyUsed = Math.min(bellyCapacity, currentLoad)
+  const bellyOverload: BellyOverload = currentLoad > bellyCapacity ? 1 : 0
   return {
-    stuffedStacks,
-    digestionRemainingSec: stuffedStacks ? Math.ceil((DIGEST_LAYER_MS - elapsed % DIGEST_LAYER_MS) / 1000) : 0,
+    bellyUsed, bellyCapacity, bellyFillRatio: Math.min(1, bellyUsed / bellyCapacity), bellyOverload, isStuffedFull: false,
+    digestionRemainingSec: currentLoad > 0 ? Math.ceil((intervalMs - elapsed % intervalMs) / 1000) : 0,
+    currentLoad,
+    nextAnchorMs: currentLoad > 0 ? bellyUpdatedAt + digested * intervalMs : nowMs,
   }
 }
 
-export type FeedOutcome = 'grew' | 'leveled_up' | 'stuffed' | 'stuffed_full'
+export type FeedOutcome = 'grew' | 'leveled_up' | 'fed' | 'stuffed' | 'stuffed_full'
 export interface FeedingState {
   experience: number
-  dailyFedCount: number
-  dailyFedDate: string | null
-  rawStuffedStacks: number
-  stuffedUpdatedAt: number
+  appetite: number
+  rawBellyLoad: number
+  rawStuffedFull: boolean
+  bellyUpdatedAt: number
+}
+
+function preserveDigestionProgress(nowMs: number, nextAnchorMs: number, nextLevel: number, appetite: number) {
+  const nextIntervalMs = getDigestIntervalMs(nextLevel, appetite)
+  // Preserve partial digestion without consuming another slot on level-up.
+  return nowMs - Math.min(nowMs - nextAnchorMs, nextIntervalMs - 1)
 }
 
 export function feedFish(state: FeedingState, nowMs: number) {
-  const { stuffedStacks } = getDigestionState(state.rawStuffedStacks, state.stuffedUpdatedAt, nowMs)
-  if (stuffedStacks === 3) return null
-  const dailyFedCount = dailyCount(state.dailyFedCount, state.dailyFedDate, nowMs)
-  if (state.experience < MAX_EXPERIENCE && dailyFedCount < DAILY_SATIETY_CAP) {
-    const experience = state.experience + 1
-    const levelDelta = getGrowth(experience).level - getGrowth(state.experience).level
-    const outcome: FeedOutcome = levelDelta ? 'leveled_up' : 'grew'
-    return { ...state, experience, dailyFedCount: dailyFedCount + 1, dailyFedDate: shanghaiDate(nowMs), outcome, levelDelta }
+  const { level } = getGrowth(state.experience)
+  const belly = getBellyState(state.rawBellyLoad, state.rawStuffedFull, state.bellyUpdatedAt, level, state.appetite, nowMs)
+  if (belly.isStuffedFull) return null
+  if (belly.currentLoad < belly.bellyCapacity) {
+    const experience = level === MAX_LEVEL ? state.experience : state.experience + 1
+    const nextLevel = getGrowth(experience).level
+    const levelDelta = nextLevel - level
+    const outcome: FeedOutcome = levelDelta ? 'leveled_up' : level === MAX_LEVEL ? 'fed' : 'grew'
+    return {
+      ...state, experience, rawBellyLoad: belly.currentLoad + 1, rawStuffedFull: false, outcome, levelDelta,
+      bellyUpdatedAt: preserveDigestionProgress(nowMs, belly.nextAnchorMs, nextLevel, state.appetite),
+    }
   }
-  return stuffFish(state, stuffedStacks, nowMs)
-}
 
-function stuffFish(state: FeedingState, stuffedStacks: number, nowMs: number) {
-  const rawStuffedStacks = stuffedStacks + 1
-  const outcome: FeedOutcome = rawStuffedStacks === 3 ? 'stuffed_full' : 'stuffed'
-  return { ...state, rawStuffedStacks, stuffedUpdatedAt: nowMs, outcome, levelDelta: 0 }
+  const rawStuffedFull = belly.bellyOverload >= 1
+  const outcome: FeedOutcome = rawStuffedFull ? 'stuffed_full' : 'stuffed'
+  return {
+    ...state, rawStuffedFull, outcome, levelDelta: 0,
+    rawBellyLoad: belly.bellyCapacity + (rawStuffedFull ? 2 : 1),
+    bellyUpdatedAt: rawStuffedFull ? nowMs : belly.nextAnchorMs,
+  }
 }
 
 export function applyGoldenFeast(state: FeedingState, nowMs: number) {
-  const { stuffedStacks } = getDigestionState(state.rawStuffedStacks, state.stuffedUpdatedAt, nowMs)
-  if (stuffedStacks === 3) return null
-  if (state.experience >= MAX_EXPERIENCE) return stuffFish(state, stuffedStacks, nowMs)
+  const { level } = getGrowth(state.experience)
+  const belly = getBellyState(state.rawBellyLoad, state.rawStuffedFull, state.bellyUpdatedAt, level, state.appetite, nowMs)
+  if (belly.isStuffedFull) return null
   const experience = Math.min(MAX_EXPERIENCE, state.experience + GOLDEN_FEAST_BONUS_XP)
-  const levelDelta = getGrowth(experience).level - getGrowth(state.experience).level
-  const outcome: FeedOutcome = levelDelta ? 'leveled_up' : 'grew'
-  return { ...state, experience, outcome, levelDelta }
+  const nextLevel = getGrowth(experience).level
+  const levelDelta = nextLevel - level
+  const nextCapacity = getBellyCapacity(nextLevel, state.appetite)
+  const totalLoad = belly.currentLoad + getGoldenFeastBellyCost(belly.bellyCapacity)
+  if (totalLoad >= nextCapacity + 2) {
+    return { ...state, experience, rawBellyLoad: nextCapacity + 2, rawStuffedFull: true, bellyUpdatedAt: nowMs, outcome: 'stuffed_full' as const, levelDelta }
+  }
+  const outcome: FeedOutcome = levelDelta ? 'leveled_up' : experience > state.experience ? 'grew' : totalLoad > nextCapacity ? 'stuffed' : 'fed'
+  return {
+    ...state, experience, rawBellyLoad: Math.min(totalLoad, nextCapacity + 1), rawStuffedFull: false, outcome, levelDelta,
+    bellyUpdatedAt: preserveDigestionProgress(nowMs, belly.nextAnchorMs, nextLevel, state.appetite),
+  }
 }

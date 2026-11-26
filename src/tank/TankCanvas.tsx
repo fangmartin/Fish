@@ -1,10 +1,10 @@
 import { useEffect, useRef, type MouseEvent } from 'react'
 import type { Fish, GoldenFeast } from '../../shared/contracts'
-import { getDigestionState, type FeedOutcome } from '../../shared/domain'
+import { formatDuration, getBellyState, type FeedOutcome } from '../../shared/domain'
 import { playSound, unlockSound } from '../audio/sound'
 import { paintWater, resolveTidePhase, type TideMode } from './ambient'
 import { burst, createNightGlow, glassRipple, sparkle } from './effects'
-import { drawFishMesh } from './meshRenderer'
+import { drawFishMesh, fishWaveSpeed } from './meshRenderer'
 import {
   createSwimmer, displayedSize, floorY, GOLDEN_SINK_SPEED, KNOCK_RADIUS, knockTank, mouthPosition, pitch, stepTank,
   type CollisionEvent, type Food, type Swimmer, type Water,
@@ -45,10 +45,12 @@ interface Props {
 type Point = { x: number; y: number }
 type VisualFish = {
   fish: Fish; swimmer: Swimmer; image: HTMLImageElement; clockOffset: number; speechSeed: number
+  wavePhase: number; digestionRemainingSec: number
 }
 
 const floatText: Record<FeedOutcome, string> = {
-  grew: '+1 成长', leveled_up: '✨ Lv.Up! 获得属性点', stuffed: '🫧 嗝~ 吃撑了', stuffed_full: '💤 撑不动啦',
+  grew: '+1 成长', leveled_up: '✨ Lv.Up! 胃口变大了', fed: '😋 干饭 +1',
+  stuffed: '🫧 嗝~ 肚子塞满啦', stuffed_full: '💤 撑翻啦',
 }
 const CROWDED_TANK_SIZE = 24
 
@@ -153,22 +155,27 @@ export function TankCanvas(props: Props) {
           const image = new Image()
           image.src = fish.assetUrl
           const index = pool.size
-          const swimmer = createSwimmer(fish,
+          const { id, size, stats, bellyFillRatio, bellyOverload } = fish
+          const swimmer = createSwimmer({ id, size, stats, bellyFillRatio, bellyOverload },
             bounds.width * (0.24 + (index * 0.236) % 0.59), bounds.height * (0.26 + (index * 0.151) % 0.5),
             index % 2 ? 0.12 : Math.PI - 0.1, Math.random() * 20)
           let speechSeed = 0
           for (const character of fish.id) speechSeed = (speechSeed * 31 + character.charCodeAt(0)) >>> 0
-          visual = { fish, image, swimmer, clockOffset: fish.serverNow - wallTime, speechSeed }
+          visual = { fish, image, swimmer, clockOffset: fish.serverNow - wallTime, speechSeed,
+            wavePhase: swimmer.phase, digestionRemainingSec: fish.digestionRemainingSec }
           pool.set(fish.id, visual)
         } else if (visual.fish !== fish) {
           visual.fish = fish
           visual.clockOffset = fish.serverNow - wallTime
         }
-        const { stuffedStacks } = getDigestionState(fish.rawStuffedStacks, fish.stuffedUpdatedAt, wallTime + visual.clockOffset)
+        const belly = getBellyState(fish.rawBellyLoad, fish.rawStuffedFull, fish.bellyUpdatedAt,
+          fish.level, fish.stats.appetite, wallTime + visual.clockOffset)
         const body = visual.swimmer.body
-        if (body.stuffedStacks !== stuffedStacks || body.stats !== fish.stats || body.size !== fish.size) {
-          visual.swimmer.body = { id: fish.id, size: fish.size, stats: fish.stats, stuffedStacks }
-        }
+        body.size = fish.size
+        body.stats = fish.stats
+        body.bellyFillRatio = belly.bellyFillRatio
+        body.bellyOverload = belly.bellyOverload
+        visual.digestionRemainingSec = belly.digestionRemainingSec
       }
 
       const feast = current.goldenFeast
@@ -264,10 +271,11 @@ export function TankCanvas(props: Props) {
         const { swimmer, image, fish } = visual
         const { x, phase, body } = swimmer
         const size = displayedSize(fish.size, bounds)
-        const stuffed = body.stuffedStacks
-        const y = swimmer.y + (stuffed === 3 ? Math.sin(seconds * 1.65 + phase * 0.16) * 5 : 0)
+        const { bellyFillRatio, bellyOverload } = body
+        const sleeping = bellyOverload === 2
+        const y = swimmer.y + (sleeping ? Math.sin(seconds * 1.65 + phase * 0.16) * 5 : 0)
         const height = size * (image.naturalHeight || 1) / Math.max(image.naturalWidth || 1, image.naturalHeight || 1)
-        const labelY = y - height / 2 - 11
+        const labelY = Math.max(11, y - height * (sleeping ? 0.9 : 0.5) - 11)
         if (tidePhase === 'night') {
           const glowHeight = Math.max(12, height * 1.26)
           ctx.drawImage(nightGlow, x - size * 0.52, y - glowHeight / 2, size * 1.04, glowHeight)
@@ -303,19 +311,21 @@ export function TankCanvas(props: Props) {
           }
         }
         let lookTarget = pointer.current ?? { x: x + Math.cos(swimmer.heading) * 120, y: y + Math.sin(swimmer.heading) * 120 }
-        if (fish.eyes?.length) {
+        if (!sleeping && fish.eyes?.length) {
           let nearest = Infinity
           for (const pellet of food.values()) {
             const gap = (x - pellet.x) ** 2 + (y - pellet.y) ** 2
             if (gap < nearest) { nearest = gap; lookTarget = pellet }
           }
         }
-        const rocked = stuffed === 3 && knock && knockAge >= 0 && knockAge < 0.45 &&
+        const rocked = sleeping && knock && knockAge >= 0 && knockAge < 0.45 &&
           (x - knock.x) ** 2 + (y - knock.y) ** 2 <= KNOCK_RADIUS ** 2
         const tilt = pitch(swimmer) + (rocked ? Math.sin(knockAge * 34) * (0.45 - knockAge) * 0.18 : 0)
+        visual.wavePhase += dt * fishWaveSpeed(swimmer.sprinting, bellyFillRatio, bellyOverload)
         if (image.complete && image.naturalWidth) drawFishMesh(ctx, image, image.naturalWidth, image.naturalHeight, {
-          x, y, size, time: phase, facing: swimmer.facing, tilt,
-          sprinting: swimmer.sprinting, stuffedStacks: stuffed, eyes: fish.eyes, lookTarget,
+          x, y, size, time: phase, wavePhase: visual.wavePhase, facing: swimmer.facing, tilt,
+          sprinting: swimmer.sprinting, bellyFillRatio, bellyOverload, isEmperor: fish.stage === 'emperor',
+          eyes: fish.eyes, lookTarget,
         })
         if (fish.keeperId === current.keeperId) {
           ctx.save()
@@ -323,13 +333,12 @@ export function TankCanvas(props: Props) {
           ctx.shadowColor = '#6ceac1'
           ctx.shadowBlur = 11
           ctx.beginPath()
-          ctx.arc(x, labelY - (stuffed === 3 ? 16 : 1), 3, 0, Math.PI * 2)
+          ctx.arc(x, labelY - (sleeping ? 16 : 1), 3, 0, Math.PI * 2)
           ctx.fill()
           ctx.restore()
         }
-        if (stuffed === 3) {
-          const { digestionRemainingSec } = getDigestionState(fish.rawStuffedStacks, fish.stuffedUpdatedAt, wallTime + visual.clockOffset)
-          caption(ctx, `撑不动了 · ${Math.ceil(digestionRemainingSec / 60)} 分钟`, x, labelY, '#102238ea', '#e9caf3')
+        if (sleeping) {
+          caption(ctx, `撑不动了 · ${formatDuration(visual.digestionRemainingSec)}`, x, labelY, '#102238ea', '#e9caf3')
           const snore = (seconds + visual.speechSeed % 9) % 4.6
           if (snore < 1.8) {
             ctx.save()
@@ -338,7 +347,9 @@ export function TankCanvas(props: Props) {
             ctx.restore()
           }
         }
-        if (stuffed > 0 && stuffed < 3 && Math.sin(phase * 1.25) > 0.91) {
+        const burping = !sleeping && (bellyOverload === 1 || bellyFillRatio >= 0.75)
+          && (phase + visual.speechSeed % 13) % (bellyOverload === 1 ? 3.2 : 9.5) < 0.65
+        if (burping) {
           caption(ctx, '嗝~', x, labelY - 4, '#102b3cb5', '#cdf1eb')
         }
         if (current.spotlight === fish.id) caption(ctx, fish.name, x, y + height / 2 + 15, '#123947e8', '#c6ffec')
@@ -353,7 +364,7 @@ export function TankCanvas(props: Props) {
             sparkle(ctx, x + Math.cos(angle) * 14, labelY - 17 + Math.sin(angle) * 5, 4, angle)
           }
         }
-        if (fish.tagline && stuffed < 3 && !swimmer.targetId && !swimmer.stun && !swimmer.scaredTimer && speaking < 2) {
+        if (fish.tagline && !sleeping && !burping && !swimmer.targetId && !swimmer.stun && !swimmer.scaredTimer && speaking < 2) {
           const period = 14 + visual.speechSeed % 11
           const progress = (seconds + (visual.speechSeed % 997) / 997 * period) % period
           if (progress < 3.6) {
@@ -383,8 +394,13 @@ export function TankCanvas(props: Props) {
         if (effect.golden && elapsed < 0.7) burst(ctx, { x, y }, elapsed / 0.7, true)
         ctx.save()
         ctx.globalAlpha = Math.min(1, (1 - elapsed) * 2)
-        const message = effect.golden
-          ? `👑 黄金大餐！${effect.xpGained ? ` +${effect.xpGained} 成长` : ' 吃撑啦'}` : floatText[effect.outcome]
+        let message = floatText[effect.outcome]
+        if (effect.golden) {
+          const growth = effect.xpGained ? `+${effect.xpGained} 成长` : ''
+          if (effect.outcome === 'stuffed_full') message = `👑 黄金大餐！${growth ? `${growth} · ` : ''}直接撑翻！`
+          else if (effect.outcome === 'stuffed') message = `👑 黄金大餐！${growth ? `${growth} · ` : ''}吃撑啦`
+          else message = `👑 黄金大餐！${growth || '美味！'}`
+        }
         caption(ctx, message, x, y - 32 - 34 * elapsed,
           effect.golden ? '#493922ed' : '#102a3deb', effect.golden ? '#ffe9a2' : '#deffe8')
         ctx.restore()

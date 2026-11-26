@@ -1,4 +1,4 @@
-import type { FeedOutcome, FishEye, GrowthStage, Stats, StuffedStacks } from './domain'
+import type { BellyOverload, FeedOutcome, FishEye, GrowthStage, Stats } from './domain'
 
 export interface Fish {
   id: string
@@ -21,14 +21,18 @@ export interface Fish {
   stats: Stats
   unspentPoints: number
   lastRespecDate: string | null
-  dailyFedCount: number
-  dailyFedDate: string | null
   dailyEatsCount: number
   totalKnockouts: number
-  rawStuffedStacks: number
-  stuffedStacks: StuffedStacks
-  stuffedUpdatedAt: number
+  rawBellyLoad: number
+  rawStuffedFull: boolean
+  bellyUpdatedAt: number
+  bellyUsed: number
+  bellyCapacity: number
+  bellyFillRatio: number
+  bellyOverload: BellyOverload
+  isStuffedFull: boolean
   digestionRemainingSec: number
+  digestIntervalSec: number
   serverNow: number
 }
 
