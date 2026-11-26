@@ -10,11 +10,49 @@ export const MIN_ART_PIXELS = 24
 export const MAX_ART_EDGE = 512
 export const MAX_ART_BYTES = 256 * 1024
 export const PELLET_LIFETIME_MS = 90_000
+export const GOLDEN_FEAST_EVERY_FEEDS = 15
+export const GOLDEN_FEAST_BONUS_XP = 3
+export const GOLDEN_FEAST_LIFETIME_MS = 120_000
+
+export const EYE_STYLES = ['googly', 'deadpan', 'fierce'] as const
+export const MAX_FISH_EYES = 4
+export type EyeStyle = typeof EYE_STYLES[number]
+export type FishEye = { x: number; y: number; radius: number; style: EyeStyle }
+
+function inRange(value: unknown, min: number, max: number): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max
+}
+
+export function validateEyes(input: unknown): FishEye[] | null {
+  if (input === undefined) return []
+  if (!Array.isArray(input) || input.length > MAX_FISH_EYES) return null
+  const eyes: FishEye[] = []
+  for (const eye of input) {
+    if (!eye || typeof eye !== 'object') return null
+    const { x, y, radius, style } = eye
+    if (!EYE_STYLES.includes(style) || !inRange(x, 0, 1) || !inRange(y, 0, 1) || !inRange(radius, 0.02, 0.2)) {
+      return null
+    }
+    eyes.push({ x, y, radius, style })
+  }
+  return eyes
+}
 
 export const STAT_KEYS = ['burst', 'stamina', 'sense', 'agility', 'brawn'] as const
 export type StatKey = typeof STAT_KEYS[number]
 export type Stats = Record<StatKey, number>
 export const EMPTY_STATS: Readonly<Stats> = { burst: 0, stamina: 0, sense: 0, agility: 0, brawn: 0 }
+const buildTitles: Record<StatKey, string> = {
+  burst: '深海鱼雷', stamina: '永动机', sense: '顺风耳', agility: '深海泥鳅', brawn: '全缸恶霸',
+}
+
+export function getBuildTitle(stats: Stats, level: number) {
+  const highest = Math.max(...STAT_KEYS.map(key => stats[key]))
+  if (!highest && level === 1) return '初生萌鱼'
+  const leaders = STAT_KEYS.filter(key => stats[key] === highest)
+  if (leaders.length === 1) return buildTitles[leaders[0]]
+  return level === MAX_LEVEL ? '深海全能王' : '全能游侠'
+}
 
 const shanghai = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -109,7 +147,21 @@ export function feedFish(state: FeedingState, nowMs: number) {
     const outcome: FeedOutcome = levelDelta ? 'leveled_up' : 'grew'
     return { ...state, experience, dailyFedCount: dailyFedCount + 1, dailyFedDate: shanghaiDate(nowMs), outcome, levelDelta }
   }
+  return stuffFish(state, stuffedStacks, nowMs)
+}
+
+function stuffFish(state: FeedingState, stuffedStacks: number, nowMs: number) {
   const rawStuffedStacks = stuffedStacks + 1
   const outcome: FeedOutcome = rawStuffedStacks === 3 ? 'stuffed_full' : 'stuffed'
   return { ...state, rawStuffedStacks, stuffedUpdatedAt: nowMs, outcome, levelDelta: 0 }
+}
+
+export function applyGoldenFeast(state: FeedingState, nowMs: number) {
+  const { stuffedStacks } = getDigestionState(state.rawStuffedStacks, state.stuffedUpdatedAt, nowMs)
+  if (stuffedStacks === 3) return null
+  if (state.experience >= MAX_EXPERIENCE) return stuffFish(state, stuffedStacks, nowMs)
+  const experience = Math.min(MAX_EXPERIENCE, state.experience + GOLDEN_FEAST_BONUS_XP)
+  const levelDelta = getGrowth(experience).level - getGrowth(state.experience).level
+  const outcome: FeedOutcome = levelDelta ? 'leveled_up' : 'grew'
+  return { ...state, experience, outcome, levelDelta }
 }

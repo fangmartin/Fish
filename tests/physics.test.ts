@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { EMPTY_STATS, type Stats, type StuffedStacks } from '../shared/domain'
-import { createSwimmer, cruiseSpeed, floorY, mouthPosition, stepTank, type Food, type Swimmer } from '../src/tank/physics'
+import { createSwimmer, cruiseSpeed, floorY, knockTank, mouthPosition, stepTank, type CollisionEvent, type Food, type Swimmer } from '../src/tank/physics'
+import { resolveTidePhase } from '../src/tank/ambient'
 
 const water = { width: 960, height: 600 }
 const body = (id: string, stats: Partial<Stats> = {}, stuffedStacks: StuffedStacks = 0, size = 40) => ({
@@ -12,6 +13,36 @@ const simulate = (fish: Swimmer[], food: Food[], seconds: number) => {
 }
 
 describe('公共鱼缸物理', () => {
+  it('敲玻璃让半径内的鱼朝反方向逃逸，并跳过撑瘫和半径外的鱼', () => {
+    const near = createSwimmer(body('near'), 450, 300, 0, 0)
+    const edge = createSwimmer(body('edge', {}, 2), 820, 300, Math.PI, 0)
+    const outside = createSwimmer(body('outside'), 821, 300, 0, 0)
+    const full = createSwimmer(body('full', {}, 3), 480, 300, 0, 0)
+    near.targetId = 'pellet'
+    near.sprinting = true
+    const group = [near, edge, outside, full]
+    expect(knockTank(group, 500, 300, water)).toEqual(['near', 'edge'])
+    expect(near).toMatchObject({ scaredTimer: 1.1, heading: Math.PI, targetId: null, sprinting: false })
+    expect(-near.pushX).toBeGreaterThan(edge.pushX)
+    expect([outside.pushX, full.pushX, full.scaredTimer]).toEqual([0, 0, 0])
+    stepTank(group, [pellet(490, 300)], water, 0.02)
+    expect(near.x).toBeLessThan(450)
+    expect(near.targetId).toBeNull()
+  })
+
+  it('高感知第一次锁定鱼食时惊觉，持续锁定不重复触发', () => {
+    const scout = createSwimmer(body('scout', { sense: 2 }), 300, 300, 0, 0)
+    const alerts: string[] = []
+    const food = { ...pellet(510, 150), golden: true }
+    stepTank([scout], [food], water, 0.02, { onAlert: id => alerts.push(id) })
+    expect(alerts).toEqual(['scout'])
+    expect(scout.alertTimer).toBe(0.75)
+    expect(food.y).toBeCloseTo(150.46)
+    stepTank([scout], [food], water, 0.12, { onAlert: id => alerts.push(id) })
+    expect(alerts).toEqual(['scout'])
+    expect(scout.alertTimer).toBeCloseTo(0.63)
+  })
+
   it('3 层鱼慢速漂浮，鱼嘴接触鱼食时也无法吃食', () => {
     const fish = createSwimmer(body('full', { sense: 6, burst: 6 }, 3), 285, 260, 0, 0)
     const mouth = mouthPosition(fish, water)
@@ -95,13 +126,21 @@ describe('公共鱼缸物理', () => {
     const attacker = createSwimmer(body('attacker', { brawn: 6 }, 0, 260), 400, 300, 0, 0)
     const peer = createSwimmer(body('peer', {}, 0, 260), 600, 300, 0, 0)
     attacker.targetId = peer.targetId = 'pellet'
+    const hits: CollisionEvent[] = []
 
-    stepTank([attacker, peer], [pellet(800, 300)], water, 1 / 60)
+    const food = [pellet(800, 300)]
+    stepTank([attacker, peer], food, water, 1 / 60, { onCollision: hit => hits.push(hit) })
 
     expect(attacker.sprinting).toBe(true)
     expect(peer.pushX).toBeGreaterThan(0)
     expect(peer.stun).toBeGreaterThan(0)
     expect(peer.sprinting).toBe(false)
+    expect(hits).toHaveLength(1)
+    expect(hits[0]).toMatchObject({ attackerId: 'attacker', victimId: 'peer', brawn: 6, force: expect.any(Number) })
+    expect(hits[0].x).toBeCloseTo((attacker.x + peer.x) / 2)
+    expect(hits[0].y).toBeCloseTo((attacker.y + peer.y) / 2)
+    stepTank([attacker, peer], food, water, 1 / 60, { onCollision: hit => hits.push(hit) })
+    expect(hits).toHaveLength(1)
   })
 
   it('鱼食下沉停留在缸底，鱼嘴接触时只选择一个赢家', () => {
@@ -151,4 +190,13 @@ describe('公共鱼缸物理', () => {
       expect(winner, `${size}px 鱼要能在 20 秒内吃掉缸底的鱼食`).toBe('chaser')
     }
   })
+})
+
+it('昼夜自动按上海时间边界切换，手动选择覆盖自动', () => {
+  const local = (time: string) => Date.parse(`2026-03-04T${time}:00+08:00`)
+  const times = ['00:00', '04:59', '05:00', '09:59', '10:00', '16:59', '17:00', '19:59', '20:00', '23:59']
+  expect(times.map(time => resolveTidePhase(local(time), 'auto')))
+    .toEqual(['night', 'night', 'dawn', 'dawn', 'day', 'day', 'dusk', 'dusk', 'night', 'night'])
+  expect(resolveTidePhase(local('13:00'), 'night')).toBe('night')
+  expect(resolveTidePhase(local('03:00'), 'day')).toBe('day')
 })

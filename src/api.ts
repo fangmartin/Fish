@@ -1,4 +1,4 @@
-import type { Claim, Fish, FishProfile, Keeper, KeeperResponse, Pellet } from '../shared/contracts'
+import type { Claim, Fish, FishProfile, FishRelease, GoldenFeastClaim, Keeper, KeeperResponse, Leaderboard, Pellet, TankView } from '../shared/contracts'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch('/api' + path, init)
@@ -18,14 +18,14 @@ export const api = {
   register: (nickname: string) => post<{ keeper: Keeper }>('/keeper/register', { nickname }),
   recover: (passcode: string) => post<{ keeper: Keeper }>('/keeper/recover', { passcode }),
   nickname: (nickname: string) => post<{ keeper: Keeper }>('/keeper/nickname', { nickname }),
-  tank: (focus: string, exclude: string[] = []) => request<{ fish: Fish[] }>(
+  tank: (focus: string, exclude: string[] = []) => request<TankView>(
     '/tank/view?' + new URLSearchParams({ focusFishId: focus, excludeIds: exclude.join(',') }),
   ),
   search: (q: string, signal: AbortSignal) => request<{ fish: Fish[] }>(
     '/fish/search?' + new URLSearchParams({ q }), { signal },
   ),
   fish: (id: string, signal?: AbortSignal) => request<{ fish: FishProfile }>(`/fish/${encodeURIComponent(id)}`, { signal }),
-  release: (name: string, pngBase64: string) => post<{ fish: Fish }>('/fish', { name, pngBase64 }),
+  release: (art: FishRelease) => post<{ fish: Fish }>('/fish', art),
   archive: (id: string) => post<{ fish: Fish }>(`/fish/${encodeURIComponent(id)}/archive`),
   stats: (id: string, stats: object) => post<{ fish: Fish }>(`/fish/${encodeURIComponent(id)}/stats`, stats),
   reset: (id: string) => post<{ fish: Fish }>(`/fish/${encodeURIComponent(id)}/stats/reset`),
@@ -33,6 +33,9 @@ export const api = {
   drop: (x: number, y: number) => post<Pellet>('/pellets/drop', { x, y }),
   claim: (id: string, winnerFishId: string) => post<Claim>(`/pellets/${id}/claim`, { winnerFishId }),
   cancel: (id: string) => post<{ remainingRations: number }>(`/pellets/${id}/cancel`, undefined, true),
+  leaderboard: (signal: AbortSignal) => request<Leaderboard>('/tank/leaderboard', { signal }),
+  knockout: (attackerFishId: string, victimFishId: string) => post<{ fish: Fish }>('/tank/knockout', { attackerFishId, victimFishId }),
+  claimFeast: (id: string, winnerFishId: string) => post<GoldenFeastClaim>(`/golden-feast/${id}/claim`, { winnerFishId }),
 }
 
 export async function copyText(text: string) {

@@ -1,9 +1,10 @@
 export type Point = { x: number; y: number }
 export type RGB = [number, number, number]
 
-export function floodFill(
-  pixels: Uint8ClampedArray, width: number, height: number, point: Point, color: RGB,
-  opacity: number, tolerance: number, mask?: Uint8ClampedArray,
+function editConnectedPixels(
+  pixels: Uint8ClampedArray, width: number, height: number, point: Point, tolerance: number,
+  mask: Uint8ClampedArray | undefined, shouldEdit: (target: Uint8ClampedArray) => boolean,
+  edit: (offset: number) => void,
 ) {
   const x = Math.floor(point.x)
   const y = Math.floor(point.y)
@@ -11,7 +12,7 @@ export function floodFill(
   const first = y * width + x
   if (mask && mask[first * 4 + 3] < 128) return false
   const target = pixels.slice(first * 4, first * 4 + 4)
-  if (target[3] === 255 && color.every((value, index) => target[index] === value)) return false
+  if (!shouldEdit(target)) return false
 
   const pending = new Int32Array(width * height)
   const visited = new Uint8Array(width * height)
@@ -30,14 +31,7 @@ export function floodFill(
   visit(first)
   for (let cursor = 0; cursor < end; cursor++) {
     const index = pending[cursor]
-    const start = index * 4
-    const alpha = opacity * (mask ? mask[start + 3] / 255 : 1)
-    const original = pixels[start + 3] / 255
-    const covered = alpha + original * (1 - alpha)
-    for (let channel = 0; channel < 3; channel++) {
-      pixels[start + channel] = (color[channel] * alpha + pixels[start + channel] * original * (1 - alpha)) / covered
-    }
-    pixels[start + 3] = covered * 255
+    edit(index * 4)
     const column = index % width
     if (column > 0) visit(index - 1)
     if (column < width - 1) visit(index + 1)
@@ -45,6 +39,30 @@ export function floodFill(
     if (index < width * (height - 1)) visit(index + width)
   }
   return end > 0
+}
+
+export function floodFill(
+  pixels: Uint8ClampedArray, width: number, height: number, point: Point, color: RGB,
+  opacity: number, tolerance: number, mask?: Uint8ClampedArray,
+) {
+  return editConnectedPixels(pixels, width, height, point, tolerance, mask,
+    target => !(target[3] === 255 && color.every((value, index) => target[index] === value)),
+    start => {
+      const alpha = opacity * (mask ? mask[start + 3] / 255 : 1)
+      const original = pixels[start + 3] / 255
+      const covered = alpha + original * (1 - alpha)
+      for (let channel = 0; channel < 3; channel++) {
+        pixels[start + channel] = (color[channel] * alpha + pixels[start + channel] * original * (1 - alpha)) / covered
+      }
+      pixels[start + 3] = covered * 255
+    })
+}
+
+export function magicWandErase(
+  pixels: Uint8ClampedArray, width: number, height: number, point: Point, tolerance: number, mask?: Uint8ClampedArray,
+) {
+  return editConnectedPixels(pixels, width, height, point, tolerance, mask, target => target[3] > 0,
+    offset => { pixels[offset + 3] = 0 })
 }
 
 export function hsvToRgb(hue: number, saturation: number, value: number): RGB {

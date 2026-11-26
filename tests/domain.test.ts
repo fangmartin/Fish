@@ -2,8 +2,9 @@ import { describe, expect, it } from 'vitest'
 import {
   DAILY_RATION_LIMIT, DAILY_SATIETY_CAP, EMPTY_STATS, MAX_ACTIVE_FISH_PER_KEEPER, MAX_EXPERIENCE,
   MAX_LEVEL, MAX_STAT_VALUE, REPORT_HIDE_THRESHOLD, STUFFED_MOVEMENT, TANK_VIEW_LIMIT,
-  allocateStats, canRespec, dailyCount, feedFish, getDigestionState, getGrowth, remainingRations,
-  shanghaiDate, unspentPoints, type FeedingState,
+  EYE_STYLES, GOLDEN_FEAST_BONUS_XP, GOLDEN_FEAST_EVERY_FEEDS, GOLDEN_FEAST_LIFETIME_MS, MAX_FISH_EYES,
+  allocateStats, applyGoldenFeast, canRespec, dailyCount, feedFish, getBuildTitle, getDigestionState, getGrowth, remainingRations,
+  shanghaiDate, unspentPoints, validateEyes, type FeedingState, type StatKey,
 } from '../shared/domain'
 
 const beforeMidnight = Date.parse('2026-03-04T15:59:59.999Z')
@@ -13,6 +14,48 @@ const newFish: FeedingState = {
 }
 
 describe('共享领域规则', () => {
+  it('眼球限制数量、样式及每个有限坐标和半径范围', () => {
+    const eye = { x: 0, y: 1, radius: 0.02, style: 'googly' }
+    expect(MAX_FISH_EYES).toBe(4)
+    expect(validateEyes(undefined)).toEqual([])
+    expect(validateEyes([])).toEqual([])
+    const allowed = [...EYE_STYLES.map(style => ({ ...eye, style })), { ...eye, radius: 0.2 }]
+    expect(validateEyes(allowed)).toEqual(allowed)
+    for (const invalid of [null, {}, [null], [4], Array(5).fill(eye),
+      [{ ...eye, style: 'unknown' }], [{ ...eye, x: '0.2' }], [{ ...eye, x: Infinity }],
+      [{ ...eye, x: -0.01 }], [{ ...eye, y: 1.01 }], [{ ...eye, radius: 0.01 }], [{ ...eye, radius: 0.21 }]]) {
+      expect(validateEyes(invalid)).toBeNull()
+    }
+  })
+
+  it('黄金大餐能连跳两级，封顶、叠吃撑及拒绝三层撑瘫', () => {
+    expect([GOLDEN_FEAST_EVERY_FEEDS, GOLDEN_FEAST_BONUS_XP, GOLDEN_FEAST_LIFETIME_MS]).toEqual([15, 3, 120_000])
+    expect(applyGoldenFeast({ ...newFish, dailyFedCount: 6 }, midnight))
+      .toMatchObject({ experience: 3, levelDelta: 2, outcome: 'leveled_up', dailyFedCount: 6 })
+    expect(applyGoldenFeast({ ...newFish, experience: 22 }, midnight))
+      .toMatchObject({ experience: 25, levelDelta: 0, outcome: 'grew' })
+    expect(applyGoldenFeast({ ...newFish, experience: 54 }, midnight))
+      .toMatchObject({ experience: 55, levelDelta: 1, rawStuffedStacks: 0 })
+    expect(applyGoldenFeast({ ...newFish, experience: 55 }, midnight))
+      .toMatchObject({ experience: 55, levelDelta: 0, outcome: 'stuffed', rawStuffedStacks: 1, stuffedUpdatedAt: midnight })
+    expect(applyGoldenFeast({ ...newFish, experience: 55, rawStuffedStacks: 2, stuffedUpdatedAt: midnight }, midnight))
+      .toMatchObject({ outcome: 'stuffed_full', rawStuffedStacks: 3 })
+    expect(applyGoldenFeast({ ...newFish, rawStuffedStacks: 3, stuffedUpdatedAt: midnight }, midnight)).toBeNull()
+  })
+
+  it('流派称号覆盖各单项、初生和并列最高', () => {
+    expect(getBuildTitle(EMPTY_STATS, 1)).toBe('初生萌鱼')
+    expect(getBuildTitle(EMPTY_STATS, 2)).toBe('全能游侠')
+    const titles: Record<StatKey, string> = {
+      burst: '深海鱼雷', stamina: '永动机', sense: '顺风耳', agility: '深海泥鳅', brawn: '全缸恶霸',
+    }
+    for (const [key, title] of Object.entries(titles)) {
+      expect(getBuildTitle({ ...EMPTY_STATS, [key]: 3 }, 4)).toBe(title)
+    }
+    expect(getBuildTitle({ ...EMPTY_STATS, brawn: 2, sense: 2 }, 5)).toBe('全能游侠')
+    expect(getBuildTitle({ burst: 2, stamina: 2, sense: 2, agility: 2, brawn: 2 }, MAX_LEVEL)).toBe('深海全能王')
+  })
+
   it('固定每日配额、在缸容量、水域切片与举报门槛', () => {
     expect([DAILY_RATION_LIMIT, MAX_ACTIVE_FISH_PER_KEEPER, TANK_VIEW_LIMIT, DAILY_SATIETY_CAP, REPORT_HIDE_THRESHOLD])
       .toEqual([10, 3, 35, 6, 3])

@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PNG } from 'pngjs'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { Claim, Fish, FishProfile, Keeper, KeeperResponse, Pellet } from '../shared/contracts'
-import { MAX_ART_BYTES, MAX_ART_EDGE } from '../shared/domain'
+import type { Claim, Fish, FishProfile, GoldenFeast, GoldenFeastClaim, Keeper, KeeperResponse, Leaderboard, Pellet, TankView } from '../shared/contracts'
+import { GOLDEN_FEAST_LIFETIME_MS, MAX_ART_BYTES, MAX_ART_EDGE } from '../shared/domain'
 import { createApp } from '../server/app'
 
 const date = Date.parse('2026-03-04T15:58:00Z')
@@ -49,8 +49,8 @@ async function register(nickname: string, ip?: string) {
   return { cookie: header.split(';')[0], header, keeper }
 }
 
-async function release(cookie: string, name: string) {
-  const response = await request('/fish', { cookie, body: { name, pngBase64: png() } })
+async function release(cookie: string, name: string, extra: object = {}) {
+  const response = await request('/fish', { cookie, body: { name, pngBase64: png(), ...extra } })
   return (await JSONresponse<{ fish: Fish }>(response, 201)).fish
 }
 
@@ -63,7 +63,11 @@ function claim(cookie: string, pelletId: string, winnerFishId: string) {
 }
 
 const view = (query = '', cookie?: string) =>
-  request('/tank/view' + query, { cookie }).then(response => JSONresponse<{ fish: Fish[] }>(response))
+  request('/tank/view' + query, { cookie }).then(response => JSONresponse<TankView>(response))
+
+const manualFeast = (secret?: string) => request('/admin/golden-feast', { method: 'POST', secret })
+const claimFeast = (id: string, winnerFishId: string, cookie?: string) =>
+  request(`/golden-feast/${id}/claim`, { cookie, body: { winnerFishId } })
 
 function openTestApp(dropLimit = 30) {
   return createApp({
@@ -85,8 +89,124 @@ afterEach(() => {
 })
 
 describe('SQLite API', () => {
+  it('下水时保存活眼球与裁剪空格后的口头禅，并拒绝非法输入', async () => {
+    const { cookie } = await register('贴纸作者')
+    const eye = { x: 0.32, y: 0.48, radius: 0.06, style: 'deadpan' }
+    const fish = await release(cookie, '会说话的鱼', { eyes: [eye], tagline: '  看我摆尾  ' })
+    expect(fish).toMatchObject({ eyes: [eye], tagline: '看我摆尾', dailyEatsCount: 0, totalKnockouts: 0 })
+    expect((await view()).fish[0]).toMatchObject({ eyes: [eye], tagline: '看我摆尾' })
+    expect(await JSONresponse(await request(`/fish/${fish.id}`))).toMatchObject({ fish: { eyes: [eye], tagline: '看我摆尾', totalEats: 0 } })
+    for (const invalid of [{ eyes: [{ ...eye, x: 2 }] }, { eyes: Array(5).fill(eye) },
+      { eyes: [{ ...eye, style: 'invalid' }] }, { tagline: '🐠'.repeat(13) }, { tagline: '喂\n鱼' }, { tagline: null }]) {
+      expect((await request('/fish', { cookie, body: { name: '无效元数据', pngBase64: png(), ...invalid } })).status).toBe(400)
+    }
+  })
+
+  it('旧鱼表自动补迁五列，并沿用已有进食与累计结算记录', async () => {
+    const { cookie } = await register('旧鱼主人')
+    const fish = await release(cookie, '旧鱼儿')
+    const pellet = await drop(cookie)
+    await JSONresponse(await claim(cookie, pellet.pelletId, fish.id))
+    const columns = ['tagline', 'eyes_json', 'daily_eats_count', 'daily_eats_date', 'total_knockouts']
+    for (const column of columns) service.db.exec(`ALTER TABLE fish DROP COLUMN ${column}`)
+    service.db.exec('DROP TABLE golden_feasts; DROP TABLE tank_state')
+    service.db.close()
+    service = openTestApp()
+
+    const names = service.db.prepare('PRAGMA table_info(fish)').all().map(row => row.name)
+    expect(names).toEqual(expect.arrayContaining(columns))
+    expect(await JSONresponse(await request(`/fish/${fish.id}`))).toMatchObject({
+      fish: { eyes: [], tagline: '', experience: 1, dailyEatsCount: 1, totalKnockouts: 0, totalEats: 1 },
+    })
+    expect(service.db.prepare("SELECT value FROM tank_state WHERE key = 'normal_feeds_total'").get()).toMatchObject({ value: 1 })
+    expect((await view()).goldenFeast).toBeNull()
+  })
+
+  it('撞晕累计与三张榜单按各自规则取前五，隐藏鱼及归档鱼不参与', async () => {
+    const { cookie } = await register('辣鱼主人')
+    const a = await release(cookie, '鱼甲')
+    const b = await release(cookie, '鱼乙')
+    const c = await release(cookie, '鱼丙')
+    const other = await register('小鱼主人')
+    const hidden = await release(other.cookie, '隐藏鱼')
+    const archived = await release(other.cookie, '归档鱼')
+    const fixture = service.db.prepare(`UPDATE fish SET experience = ?, daily_eats_count = ?, daily_eats_date = ?,
+      total_knockouts = ?, brawn = ?, created_at = ? WHERE id = ?`)
+    fixture.run(25, 2, '2026-03-04', 1, 2, time - 9, a.id)
+    fixture.run(30, 2, '2026-03-04', 1, 5, time, b.id)
+    fixture.run(25, 99, '2026-03-03', 2, 4, time - 10, c.id)
+    for (const id of [hidden.id, archived.id]) fixture.run(55, 999, '2026-03-04', 999, 6, time - 20, id)
+    service.db.prepare('UPDATE fish SET is_hidden = 1 WHERE id = ?').run(hidden.id)
+    await JSONresponse(await request(`/fish/${archived.id}/archive`, { method: 'POST', cookie: other.cookie }))
+    const fill = await register('其余鱼主人')
+    for (let index = 0; index < 3; index++) await release(fill.cookie, '鱼' + index)
+
+    const hit = { attackerFishId: a.id, victimFishId: b.id }
+    expect((await request('/tank/knockout', { body: hit })).status).toBe(401)
+    expect((await request('/tank/knockout', { cookie, body: { ...hit, victimFishId: a.id } })).status).toBe(400)
+    expect((await request('/tank/knockout', { cookie, body: { ...hit, victimFishId: hidden.id } })).status).toBe(409)
+    expect(await JSONresponse(await request('/tank/knockout', { cookie, body: hit })))
+      .toMatchObject({ fish: { id: a.id, totalKnockouts: 2 } })
+    const boards = await JSONresponse<Leaderboard>(await request('/tank/leaderboard'))
+    const ids = (list: Fish[]) => list.slice(0, 3).map(fish => fish.id)
+    expect(ids(boards.gluttons)).toEqual([b.id, a.id, c.id])
+    expect(boards.gluttons[2].dailyEatsCount).toBe(0)
+    expect(ids(boards.bullies)).toEqual([c.id, a.id, b.id])
+    expect(ids(boards.giants)).toEqual([b.id, c.id, a.id])
+    for (const board of [boards.gluttons, boards.bullies, boards.giants]) {
+      expect(board).toHaveLength(5)
+      expect(board.some(fish => fish.id === hidden.id || fish.id === archived.id)).toBe(false)
+    }
+  })
+
+  it('累计 15 颗普通鱼食触发黄金大餐，并发只令一条鱼加 3 经验并连升', async () => {
+    const first = await register('第一位投喂者')
+    const second = await register('第二位投喂者')
+    const fish = [await release(first.cookie, '鱼一'), await release(first.cookie, '鱼二'), await release(first.cookie, '鱼三')]
+    const winner = await release(second.cookie, '黄金赢家')
+    for (let index = 0; index < 15; index++) {
+      const cookie = index < 10 ? first.cookie : second.cookie
+      const pellet = await drop(cookie)
+      await JSONresponse(await claim(cookie, pellet.pelletId, fish[index % fish.length].id))
+      if (index < 14) expect((await view()).goldenFeast).toBeNull()
+    }
+    const meal = (await view()).goldenFeast!
+    expect(meal).toMatchObject({ y: 0.14, createdAt: time, expiresAt: time + GOLDEN_FEAST_LIFETIME_MS })
+    expect(meal.x).toBeGreaterThanOrEqual(0.2)
+    expect(meal.x).toBeLessThanOrEqual(0.8)
+    expect((await claimFeast(meal.id, winner.id)).status).toBe(401)
+
+    const attempts = await Promise.all([claimFeast(meal.id, winner.id, first.cookie),
+      claimFeast(meal.id, winner.id, second.cookie), claimFeast(meal.id, winner.id, second.cookie)])
+    expect(attempts.map(result => result.status).sort()).toEqual([200, 409, 409])
+    expect(await JSONresponse<GoldenFeastClaim>(attempts.find(result => result.ok)!)).toMatchObject({
+      feastId: meal.id, xpGained: 3, levelDelta: 2, outcome: 'leveled_up',
+      fish: { id: winner.id, experience: 3, level: 3, unspentPoints: 2, dailyFedCount: 0, dailyEatsCount: 1 },
+    })
+    expect((await view()).goldenFeast).toBeNull()
+    expect(await JSONresponse(await request('/keeper/me', { cookie: second.cookie }))).toMatchObject({ remainingRations: 5 })
+  })
+
+  it('管理员可触发黄金大餐，同一时间只保留一颗，过期拒绝结算', async () => {
+    const { cookie } = await register('黄金鱼主人')
+    const fish = await release(cookie, '满级金鱼')
+    service.db.prepare('UPDATE fish SET experience = 55 WHERE id = ?').run(fish.id)
+    expect((await manualFeast()).status).toBe(403)
+    const { goldenFeast: first } = await JSONresponse<{ goldenFeast: GoldenFeast }>(await manualFeast('test-only-secret'), 201)
+    expect(await JSONresponse(await manualFeast('test-only-secret'))).toEqual({ goldenFeast: first })
+    expect(await JSONresponse(await claimFeast(first.id, fish.id, cookie))).toMatchObject({
+      outcome: 'stuffed', xpGained: 0, fish: { experience: 55, stuffedStacks: 1, dailyEatsCount: 1 },
+    })
+    const { goldenFeast: second } = await JSONresponse<{ goldenFeast: GoldenFeast }>(await manualFeast('test-only-secret'), 201)
+    time += GOLDEN_FEAST_LIFETIME_MS
+    expect((await claimFeast(second.id, fish.id, cookie)).status).toBe(409)
+    expect((await view()).goldenFeast).toBeNull()
+    const { goldenFeast: third } = await JSONresponse<{ goldenFeast: GoldenFeast }>(await manualFeast('test-only-secret'), 201)
+    expect(third.id).not.toBe(second.id)
+  })
+
   it('空缸不会生成鱼，重启后隐藏旧演示鱼并保留进食历史', async () => {
-    expect(await view()).toEqual({ fish: [] })
+    expect(await view()).toEqual({ fish: [], goldenFeast: null })
     const assets = join(temp, 'data', 'fish')
     expect(readdirSync(assets)).toEqual([])
     const { cookie } = await register('访客')
@@ -418,11 +538,25 @@ describe('SQLite API', () => {
       expect(await event('pellet_consumed')).toMatchObject({ pelletId: pellet.pelletId, outcome: 'leveled_up', fish: { id: fish.id } })
       await JSONresponse(await request(`/fish/${fish.id}/stats`, { cookie, body: { burst: 1 } }))
       expect(await event('fish_updated')).toMatchObject({ fish: { id: fish.id, stats: { burst: 1 } } })
+      service.db.prepare('UPDATE fish SET experience = 55, stuffed_stacks = 2, stuffed_updated_at = ? WHERE id = ?')
+        .run(time, fish.id)
+      const lastMeal = await drop(cookie)
+      await JSONresponse(await claim(cookie, lastMeal.pelletId, fish.id))
+      expect(await event('tank_ticker')).toMatchObject({ kind: 'stuffed', fishId: fish.id })
       await JSONresponse(await request(`/fish/${fish.id}/archive`, { method: 'POST', cookie }))
       expect(await event('fish_archived')).toEqual({ fishId: fish.id })
       const adminFish = await release(cookie, '待隐藏')
       await JSONresponse(await request(`/admin/fish/${adminFish.id}`, { method: 'DELETE', secret: 'test-only-secret' }))
       expect(await event('fish_hidden')).toEqual({ fishId: adminFish.id })
+      const goldenFish = await release(cookie, '来吃金鱼食')
+      const victim = await release(cookie, '被撞晕的小鱼')
+      await JSONresponse(await request('/tank/knockout', { cookie, body: { attackerFishId: goldenFish.id, victimFishId: victim.id } }))
+      expect(await event('tank_ticker')).toMatchObject({ kind: 'knockout', fishId: goldenFish.id, createdAt: time })
+      const { goldenFeast } = await JSONresponse<{ goldenFeast: GoldenFeast }>(await manualFeast('test-only-secret'), 201)
+      expect(await event('golden_feast_spawned')).toEqual({ goldenFeast })
+      await JSONresponse(await claimFeast(goldenFeast.id, goldenFish.id, cookie))
+      expect(await event('golden_feast_consumed')).toMatchObject({ feastId: goldenFeast.id, xpGained: 3, fish: { id: goldenFish.id } })
+      expect(await event('tank_ticker')).toMatchObject({ kind: 'golden_feast', fishId: goldenFish.id, createdAt: time })
     } finally {
       await reader.cancel()
     }

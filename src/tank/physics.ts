@@ -16,6 +16,8 @@ export interface Swimmer {
   energy: number
   rest: number
   stun: number
+  alertTimer: number
+  scaredTimer: number
   targetId: string | null
   reaction: number
   phase: number
@@ -31,6 +33,21 @@ export interface Food {
   y: number
   age: number
   claiming: boolean
+  golden?: boolean
+}
+
+export interface CollisionEvent {
+  attackerId: string
+  victimId: string
+  x: number
+  y: number
+  brawn: number
+  force: number
+}
+
+interface TankStepEvents {
+  onCollision?: (hit: CollisionEvent) => void
+  onAlert?: (fishId: string) => void
 }
 
 export interface Water {
@@ -44,15 +61,40 @@ const SPLASH_SECONDS = 0.48
 const energyLimit = (stamina: number) => 2.3 + stamina * 0.49
 export const displayedSize = (size: number, water: Water) => Math.min(size, water.width * 0.35, water.height * 0.48)
 export const floorY = ({ height }: Water) => height * 0.91
+export const KNOCK_RADIUS = 320
+export const GOLDEN_SINK_SPEED = 23
 const wrap = (angle: number) => Math.atan2(Math.sin(angle), Math.cos(angle))
 const clamp = (value: number, low: number, high: number) => Math.min(high, Math.max(low, value))
 
 export function createSwimmer(body: Body, x: number, y: number, heading: number, phase: number): Swimmer {
   return {
     body, x, y, heading, phase, speed: cruiseSpeed(body), energy: energyLimit(body.stats.stamina),
-    rest: 0, stun: 0, targetId: null, reaction: 0, facing: Math.cos(heading) > 0 ? -1 : 1,
+    rest: 0, stun: 0, alertTimer: 0, scaredTimer: 0, targetId: null, reaction: 0, facing: Math.cos(heading) > 0 ? -1 : 1,
     pushX: 0, pushY: 0, sprinting: false,
   }
+}
+
+export function knockTank(fish: Swimmer[], x: number, y: number, water: Water): string[] {
+  const startled: string[] = []
+  const pointX = clamp(x, 0, water.width)
+  const pointY = clamp(y, 0, water.height)
+  for (const swimmer of fish) {
+    if (swimmer.body.stuffedStacks === 3) continue
+    const dx = swimmer.x - pointX
+    const dy = swimmer.y - pointY
+    const distance = Math.hypot(dx, dy)
+    if (distance > KNOCK_RADIUS) continue
+    if (distance > 0) swimmer.heading = Math.atan2(dy, dx)
+    const force = 45 + (1 - distance / KNOCK_RADIUS) * 220
+    swimmer.pushX += Math.cos(swimmer.heading) * force
+    swimmer.pushY += Math.sin(swimmer.heading) * force
+    swimmer.scaredTimer = 1.1
+    swimmer.alertTimer = 0
+    swimmer.targetId = null
+    swimmer.sprinting = false
+    startled.push(swimmer.body.id)
+  }
+  return startled
 }
 
 export function pitch(fish: Swimmer) {
@@ -88,9 +130,9 @@ function nearestFood(fish: Swimmer, pellets: Food[], water: Water) {
   return nearest && { pellet: nearest, inSight: distance <= sightRadius(fish.body.stats.sense) ** 2 }
 }
 
-export function stepTank(fish: Swimmer[], pellets: Food[], water: Water, dt: number) {
+export function stepTank(fish: Swimmer[], pellets: Food[], water: Water, dt: number, events?: TankStepEvents) {
   for (const pellet of pellets) {
-    pellet.y = Math.min(floorY(water), pellet.y + 37 * dt)
+    pellet.y = Math.min(floorY(water), pellet.y + (pellet.golden ? GOLDEN_SINK_SPEED : 37) * dt)
     pellet.age += dt
   }
 
@@ -106,13 +148,19 @@ export function stepTank(fish: Swimmer[], pellets: Food[], water: Water, dt: num
     swimmer.phase += dt
     swimmer.stun = Math.max(0, swimmer.stun - dt)
     swimmer.rest = Math.max(0, swimmer.rest - dt)
+    swimmer.alertTimer = Math.max(0, swimmer.alertTimer - dt)
+    swimmer.scaredTimer = Math.max(0, swimmer.scaredTimer - dt)
 
-    const food = body.stuffedStacks < 3 ? nearestFood(swimmer, pellets, water) : undefined
+    const food = body.stuffedStacks < 3 && !swimmer.scaredTimer ? nearestFood(swimmer, pellets, water) : undefined
     const target = food?.pellet
     const targetId = target?.id ?? null
     if (swimmer.targetId !== targetId) {
       swimmer.targetId = targetId
       swimmer.reaction = food ? 0.34 - stats.sense * 0.045 + (food.inSight ? 0 : 0.1) : 0
+      if (target && stats.sense >= 2) {
+        swimmer.alertTimer = 0.75
+        events?.onAlert?.(body.id)
+      }
     }
     swimmer.reaction = Math.max(0, swimmer.reaction - dt)
     const pursuit = target && swimmer.reaction === 0
@@ -154,7 +202,7 @@ export function stepTank(fish: Swimmer[], pellets: Food[], water: Water, dt: num
     swimmer.heading = wrap(swimmer.heading + clamp(wrap(heading - swimmer.heading), -rotation, rotation))
     const speed = swimmer.sprinting
       ? (cruiseSpeed(body) + (62 + stats.burst * 22) * movement) * clamp(distance / (size * 0.56), 0.39, 1)
-      : cruiseSpeed(body) * (swimmer.rest || swimmer.stun ? 0.66 : 1)
+      : cruiseSpeed(body) * (swimmer.scaredTimer ? 1 + swimmer.scaredTimer : swimmer.rest || swimmer.stun ? 0.66 : 1)
     const acceleration = (2.8 + stats.agility * 0.62) * movement
     swimmer.speed += (speed - swimmer.speed) * (1 - Math.exp(-acceleration * dt))
     swimmer.x = clamp(swimmer.x + (Math.cos(swimmer.heading) * swimmer.speed + swimmer.pushX) * dt,
@@ -169,11 +217,10 @@ export function stepTank(fish: Swimmer[], pellets: Food[], water: Water, dt: num
     swimmer.pushY *= Math.exp(-4.4 * dt)
   }
 
-  const impact = new Set<Swimmer>()
   for (const attacker of fish) {
     if (!attacker.sprinting || attacker.stun) continue
     for (const peer of fish) {
-      if (peer === attacker || impact.has(peer)) continue
+      if (peer === attacker || peer.stun) continue
       const dx = peer.x - attacker.x
       const dy = peer.y - attacker.y
       const gap = Math.hypot(dx, dy)
@@ -185,7 +232,11 @@ export function stepTank(fish: Swimmer[], pellets: Food[], water: Water, dt: num
       peer.pushY += dy / gap * force
       peer.stun = 0.24 + attacker.body.stats.brawn * 0.058
       peer.sprinting = false
-      impact.add(peer)
+      events?.onCollision?.({
+        attackerId: attacker.body.id, victimId: peer.body.id,
+        x: (attacker.x + peer.x) / 2, y: (attacker.y + peer.y) / 2,
+        brawn: attacker.body.stats.brawn, force,
+      })
     }
   }
 
@@ -196,10 +247,10 @@ export function stepTank(fish: Swimmer[], pellets: Food[], water: Water, dt: num
     let winner: Swimmer | undefined
     let nearest = Infinity
     for (const swimmer of fish) {
-      if (swimmer.body.stuffedStacks === 3 || swimmer.stun) continue
+      if (swimmer.body.stuffedStacks === 3 || swimmer.stun || swimmer.scaredTimer) continue
       const mouth = mouthPosition(swimmer, water)
       const gap = Math.hypot(mouth.x - pellet.x, mouth.y - pellet.y)
-      const reach = 9 + Math.min(12, displayedSize(swimmer.body.size, water) * 0.075)
+      const reach = (pellet.golden ? 16 : 9) + Math.min(12, displayedSize(swimmer.body.size, water) * 0.075)
       if (gap <= reach && gap < nearest) {
         winner = swimmer
         nearest = gap

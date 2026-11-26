@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState, type PointerEvent } from 'react'
-import { MAX_ART_BYTES, MAX_ART_EDGE } from '../../shared/domain'
+import type { FishRelease } from '../../shared/contracts'
+import { EYE_STYLES, MAX_ART_BYTES, MAX_ART_EDGE, MAX_FISH_EYES, type EyeStyle } from '../../shared/domain'
 import { Icon } from '../icons'
 import { Modal } from '../Modal'
-import { drawFishMesh } from '../tank/meshRenderer'
+import { drawFishEye, drawFishMesh } from '../tank/meshRenderer'
 import { ColorPicker } from './ColorPicker'
-import { cropCanvas, exportFish } from './exportFish'
-import { floodFill, hsvToRgb, rgbToHsv, type Point } from './paint'
+import { cropCanvas, exportFish, type CanvasEye } from './exportFish'
+import { floodFill, hsvToRgb, magicWandErase, rgbToHsv, type Point } from './paint'
 import { STENCILS, STUDIO_HEIGHT as HEIGHT, STUDIO_WIDTH as WIDTH } from './stencils'
 
 const tools = [
@@ -14,7 +15,10 @@ const tools = [
   { id: 'fill', key: 'G', label: '填充' },
   { id: 'picker', key: 'I', label: '吸管' },
   { id: 'line', key: 'L', label: '直线' },
+  { id: 'eye', key: 'O', label: '活眼球' },
+  { id: 'wand', key: 'W', label: '魔棒去底' },
 ] as const
+const eyeNames: Record<EyeStyle, string> = { googly: '豆豆眼', deadpan: '死鱼眼', fierce: '愤怒眼' }
 
 type Tool = typeof tools[number]['id']
 type TemplateMode = 'none' | 'guide' | 'clip'
@@ -28,12 +32,13 @@ interface StudioProps {
   onClose: () => void
   canRelease: boolean
   onNeedKeeper: () => void
-  onRelease: (name: string, pngBase64: string) => Promise<void>
+  onRelease: (art: FishRelease) => Promise<void>
 }
 
 export function Studio({ onClose, canRelease, onNeedKeeper, onRelease }: StudioProps) {
   const art = useRef<HTMLCanvasElement>(null)
   const guidance = useRef<HTMLCanvasElement>(null)
+  const eyeLayer = useRef<HTMLCanvasElement>(null)
   const preview = useRef<HTMLCanvasElement>(null)
   const releaseName = useRef<HTMLInputElement>(null)
   const imageInput = useRef<HTMLInputElement>(null)
@@ -44,6 +49,9 @@ export function Studio({ onClose, canRelease, onNeedKeeper, onRelease }: StudioP
   const clipPixels = useRef<Uint8ClampedArray | undefined>(undefined)
   const [history, setHistory] = useState({ undo: 0, redo: 0 })
   const [name, setName] = useState('')
+  const [tagline, setTagline] = useState('')
+  const [eyes, setEyes] = useState<CanvasEye[]>([])
+  const [eyeStyle, setEyeStyle] = useState<EyeStyle>('googly')
   const [tool, setTool] = useState<Tool>('pen')
   const [previewing, setPreviewing] = useState(false)
   const [hint, setHint] = useState(false)
@@ -55,6 +63,7 @@ export function Studio({ onClose, canRelease, onNeedKeeper, onRelease }: StudioP
   const [size, setSize] = useState(15)
   const [opacity, setOpacity] = useState(100)
   const [tolerance, setTolerance] = useState(32)
+  const [wandTolerance, setWandTolerance] = useState(36)
   const [color, setColor] = useState(() => rgbToHsv([114, 225, 191]))
   const [confirming, setConfirming] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -136,27 +145,35 @@ export function Studio({ onClose, canRelease, onNeedKeeper, onRelease }: StudioP
   }, [stencilPath, mode, mirrorX, mirrorY])
 
   useEffect(() => {
+    const ctx = eyeLayer.current!.getContext('2d')!
+    ctx.clearRect(0, 0, WIDTH, HEIGHT)
+    for (const eye of eyes) drawFishEye(ctx, eye.x, eye.y, eye.radius, eye.style)
+  }, [eyes])
+
+  useEffect(() => {
     if (!previewing || !preview.current) return
     const ctx = preview.current.getContext('2d')!
     let frame = 0
     let lastRefresh = -Infinity
     let version = -1
-    let source: HTMLCanvasElement | null = null
+    let source: ReturnType<typeof cropCanvas> = null
     function draw(time: number) {
       if (rev.current !== version && time - lastRefresh > 140) {
-        source = cropCanvas(art.current!, 420)
+        source = cropCanvas(art.current!, 420, eyes)
         version = rev.current
         lastRefresh = time
       }
       ctx.clearRect(0, 0, 400, 124)
       if (source) {
         const seconds = time / 1000
-        drawFishMesh(ctx, source, source.width, source.height, {
+        const { canvas } = source
+        drawFishMesh(ctx, canvas, canvas.width, canvas.height, {
           x: 200 + Math.sin(seconds * 0.85) * 88,
           y: 62 + Math.cos(seconds * 1.21) * 7,
-          size: Math.min(168, 92 * Math.max(1, source.width / source.height)),
+          size: Math.min(168, 92 * Math.max(1, canvas.width / canvas.height)),
           time: seconds, facing: -Math.tanh(Math.cos(seconds * 0.85) * 9),
           tilt: Math.sin(seconds * 1.21) * 0.045,
+          eyes: source.eyes,
         })
       } else {
         ctx.fillStyle = '#9ebac4'
@@ -168,7 +185,7 @@ export function Studio({ onClose, canRelease, onNeedKeeper, onRelease }: StudioP
     }
     frame = requestAnimationFrame(draw)
     return () => cancelAnimationFrame(frame)
-  }, [previewing])
+  }, [previewing, eyes])
 
   function getPoint(clientX: number, clientY: number): Point {
     const rect = art.current!.getBoundingClientRect()
@@ -238,17 +255,27 @@ export function Studio({ onClose, canRelease, onNeedKeeper, onRelease }: StudioP
     const canvas = event.currentTarget
     const point = getPoint(event.clientX, event.clientY)
     const ctx = context(canvas)
+    if (tool === 'eye') {
+      const hit = eyes.findIndex(eye => Math.hypot(eye.x - point.x, eye.y - point.y) <= eye.radius + 4)
+      if (hit >= 0) setEyes(eyes.filter((_, index) => index !== hit))
+      else if (eyes.length < MAX_FISH_EYES) setEyes([...eyes, { ...point, radius: 11 + size * 0.36, style: eyeStyle }])
+      else setError('最多可以放 4 只眼球，点击已有眼球可移除')
+      return
+    }
     if (tool === 'picker') {
       const [r, g, b, alpha] = ctx.getImageData(point.x, point.y, 1, 1).data
       if (alpha) setColor(rgbToHsv([r, g, b]))
       return
     }
     const before = snapshot(canvas)
-    if (tool === 'fill') {
+    if (tool === 'fill' || tool === 'wand') {
       const next = snapshot(canvas)
       let changed = false
       for (const region of reflected(point)) {
-        changed = floodFill(next.data, WIDTH, HEIGHT, region, rgb, opacity / 100, tolerance, clipPixels.current) || changed
+        const applied = tool === 'wand'
+          ? magicWandErase(next.data, WIDTH, HEIGHT, region, wandTolerance, clipPixels.current)
+          : floodFill(next.data, WIDTH, HEIGHT, region, rgb, opacity / 100, tolerance, clipPixels.current)
+        changed = applied || changed
       }
       if (changed) {
         remember(before)
@@ -327,8 +354,13 @@ export function Studio({ onClose, canRelease, onNeedKeeper, onRelease }: StudioP
       setError('请给鱼取一个 1～16 字的名字')
       return
     }
-    const png = exportFish(art.current!)
-    if (!png) {
+    const phrase = tagline.trim()
+    if ([...phrase].length > 12 || /\p{Cc}/u.test(phrase)) {
+      setError('口头禅最多 12 字，且不能包含控制字符')
+      return
+    }
+    const artwork = exportFish(art.current!, eyes)
+    if (!artwork) {
       setError('请先画几笔，或导入一张有内容的图片')
       setConfirming(false)
       return
@@ -341,7 +373,7 @@ export function Studio({ onClose, canRelease, onNeedKeeper, onRelease }: StudioP
     setBusy(true)
     setError('')
     try {
-      await onRelease(title, png)
+      await onRelease({ name: title, tagline: phrase, ...artwork })
     } catch (error) {
       setError(error instanceof Error ? error.message : '下水失败，请再试一次')
       setConfirming(false)
@@ -406,6 +438,7 @@ export function Studio({ onClose, canRelease, onNeedKeeper, onRelease }: StudioP
           <canvas className={`drawing-canvas tool-${tool}`} ref={art} width={WIDTH} height={HEIGHT}
             aria-label="手绘鱼的透明画布" onPointerDown={begin} onPointerMove={move}
             onPointerUp={end} onPointerCancel={end} onLostPointerCapture={end} />
+          <canvas className="eye-canvas" ref={eyeLayer} width={WIDTH} height={HEIGHT} aria-hidden="true" />
         </div>
         {error && !confirming && <p className="form-error" role="alert">{error}</p>}
         <div className="canvas-meta"><span>{WIDTH} × {HEIGHT}</span><span>{tools.find(item => item.id === tool)?.label} · {size} px</span></div>
@@ -416,6 +449,15 @@ export function Studio({ onClose, canRelease, onNeedKeeper, onRelease }: StudioP
           {tools.map(item => <button type="button" key={item.id} aria-pressed={tool === item.id} title={`${item.label} (${item.key})`}
             onClick={() => setTool(item.id)}><Icon name={item.id} /><span>{item.label}</span><kbd>{item.key}</kbd></button>)}
         </div>
+        {tool === 'eye' && <>
+          <div className="segments" aria-label="眼球样式">
+            {EYE_STYLES.map(style => <button type="button" key={style} aria-pressed={eyeStyle === style}
+              onClick={() => setEyeStyle(style)}>{eyeNames[style]}</button>)}
+          </div>
+          <button className="canvas-action" type="button" disabled={!eyes.length} onClick={() => setEyes([])}>
+            <Icon name="clear" /> 清除眼球（{eyes.length}/{MAX_FISH_EYES}）
+          </button>
+        </>}
         <div className="segments">
           <button type="button" aria-pressed={mirrorX} onClick={() => setMirrorX(!mirrorX)}><Icon name="mirrorX" /> 左右对称</button>
           <button type="button" aria-pressed={mirrorY} onClick={() => setMirrorY(!mirrorY)}><Icon name="mirrorY" /> 上下对称</button>
@@ -432,6 +474,8 @@ export function Studio({ onClose, canRelease, onNeedKeeper, onRelease }: StudioP
           <input type="range" min={10} max={100} value={opacity} onChange={event => setOpacity(+event.target.value)} /></label>
         {tool === 'fill' && <label className="slider"><span>填充容差 <output>{tolerance}</output></span>
           <input type="range" min={0} max={120} value={tolerance} onChange={event => setTolerance(+event.target.value)} /></label>}
+        {tool === 'wand' && <label className="slider"><span>去底容差 <output>{wandTolerance}</output></span>
+          <input type="range" min={0} max={120} value={wandTolerance} onChange={event => setWandTolerance(+event.target.value)} /></label>}
       </aside>
     </div>
     {confirming && <Modal title="放生下水" onClose={() => { if (!busy) setConfirming(false) }}>
@@ -441,7 +485,11 @@ export function Studio({ onClose, canRelease, onNeedKeeper, onRelease }: StudioP
             aria-invalid={!!error} aria-describedby={error ? 'release-name-error' : undefined}
             onChange={event => { setName(event.target.value); setError('') }} />
         </label>
-        <p className="muted">下水后，鱼的外观与名字将永久锁定。</p>
+        <label>口头禅（选填，最多 12 字）
+          <input value={tagline} maxLength={24} disabled={busy} placeholder="想让鱼说什么？"
+            onChange={event => { setTagline(event.target.value); setError('') }} />
+        </label>
+        <p className="muted">下水后，鱼的外观、名字和口头禅将永久锁定。</p>
         <p className="muted">画作会压缩至最长边 {MAX_ART_EDGE} 像素以内，体积不超过 {MAX_ART_BYTES / 1024} KB。</p>
         {error && <p id="release-name-error" className="form-error" role="alert">{error}</p>}
         <div className="modal-actions">

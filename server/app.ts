@@ -6,10 +6,11 @@ import { bodyLimit } from 'hono/body-limit'
 import { getCookie, setCookie } from 'hono/cookie'
 import { HTTPException } from 'hono/http-exception'
 import { streamSSE } from 'hono/streaming'
-import type { FeedingRecord, TankEvents } from '../shared/contracts'
+import type { FeedingRecord, GoldenFeast, TankEvents, TankTicker } from '../shared/contracts'
 import {
-  DAILY_RATION_LIMIT, MAX_ACTIVE_FISH_PER_KEEPER, MAX_ART_BYTES, MAX_ART_EDGE, PELLET_LIFETIME_MS, REPORT_HIDE_THRESHOLD,
-  TANK_VIEW_LIMIT, allocateStats, canRespec, feedFish, getDigestionState, getGrowth, remainingRations, shanghaiDate,
+  DAILY_RATION_LIMIT, GOLDEN_FEAST_EVERY_FEEDS, GOLDEN_FEAST_LIFETIME_MS, MAX_ACTIVE_FISH_PER_KEEPER,
+  MAX_ART_BYTES, MAX_ART_EDGE, PELLET_LIFETIME_MS, REPORT_HIDE_THRESHOLD, TANK_VIEW_LIMIT,
+  allocateStats, applyGoldenFeast, canRespec, feedFish, getDigestionState, getGrowth, remainingRations, shanghaiDate, validateEyes,
 } from '../shared/domain'
 import { parseArtwork } from './art'
 import { openStorage, presentFish, type FishRow, type KeeperRow } from './storage'
@@ -35,6 +36,7 @@ type EventListener = (event: keyof TankEvents, data: string) => void
 const safeId = /^[a-z0-9-]{1,64}$/
 const cookieName = 'fish_keeper'
 const passcodeAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+const inTank = "f.status = 'active' AND f.is_hidden = 0"
 
 function createPasscode() {
   const letters = Array.from(randomBytes(12), byte => passcodeAlphabet[byte & 31]).join('')
@@ -83,6 +85,56 @@ export function createApp(options: Options) {
 
   function requireKeeper(c: Context) {
     return keeperFor(c) ?? fail(401, '请先设置养鱼人昵称')
+  }
+
+  function requireAdmin(c: Context) {
+    const expected = Buffer.from(options.adminSecret ?? '')
+    const provided = Buffer.from(c.req.header('X-Admin-Secret') ?? '')
+    if (!expected.length || provided.length !== expected.length || !timingSafeEqual(provided, expected)) fail(403, '无管理员权限')
+  }
+
+  function activeFish(id: string) {
+    const row = findFish(id)
+    if (!row || row.status !== 'active' || row.is_hidden) fail(409, '这条鱼已离开公共鱼缸')
+    return row
+  }
+
+  function ticker(kind: TankTicker['kind'], text: string, fishId: string, createdAt: number) {
+    broadcast('tank_ticker', { id: randomUUID(), kind, text, fishId, createdAt })
+  }
+
+  function activeFeast(time: number) {
+    return (db.prepare(`
+      SELECT id, x, y, created_at AS createdAt, expires_at AS expiresAt
+      FROM golden_feasts WHERE status = 'active' AND expires_at > ?
+    `).get(time) as GoldenFeast | undefined) ?? null
+  }
+
+  function spawnFeast(time: number) {
+    const existing = activeFeast(time)
+    if (existing) return { goldenFeast: existing, spawned: false }
+    db.prepare("UPDATE golden_feasts SET status = 'expired' WHERE status = 'active' AND expires_at <= ?").run(time)
+    const goldenFeast = {
+      id: randomUUID(), x: 0.2 + Math.random() * 0.6, y: 0.14, createdAt: time, expiresAt: time + GOLDEN_FEAST_LIFETIME_MS,
+    }
+    db.prepare(`INSERT INTO golden_feasts(id, x, y, created_at, expires_at, status)
+      VALUES (?, ?, ?, ?, ?, 'active')`).run(goldenFeast.id, goldenFeast.x, goldenFeast.y, time, goldenFeast.expiresAt)
+    return { goldenFeast, spawned: true }
+  }
+
+  function settleFish(row: FishRow, time: number, feed: typeof feedFish | typeof applyGoldenFeast) {
+    const next = feed({
+      experience: row.experience, dailyFedCount: row.daily_fed_count, dailyFedDate: row.daily_fed_date,
+      rawStuffedStacks: row.stuffed_stacks, stuffedUpdatedAt: row.stuffed_updated_at,
+    }, time)
+    if (!next) fail(409, '这条鱼撑不动了')
+    const today = shanghaiDate(time)
+    db.prepare(`UPDATE fish SET experience = ?, daily_fed_count = ?, daily_fed_date = ?,
+      stuffed_stacks = ?, stuffed_updated_at = ?, updated_at = ?,
+      daily_eats_count = CASE WHEN daily_eats_date = ? THEN daily_eats_count + 1 ELSE 1 END, daily_eats_date = ?
+      WHERE id = ?`).run(next.experience, next.dailyFedCount, next.dailyFedDate, next.rawStuffedStacks,
+        next.stuffedUpdatedAt, time, today, today, row.id)
+    return { ...next, fish: presentFish(findFish(row.id)!, time) }
   }
 
   function issueCookie(c: Context, session: string) {
@@ -212,7 +264,6 @@ export function createApp(options: Options) {
   api.get('/tank/view', c => {
     const keeper = keeperFor(c)
     const time = now()
-    const inTank = "f.status = 'active' AND f.is_hidden = 0"
     const selected = new Map<string, FishRow>()
     const focus = c.req.query('focusFishId')
     if (focus && safeId.test(focus)) {
@@ -235,7 +286,40 @@ export function createApp(options: Options) {
     }
     fill(Math.min(12, TANK_VIEW_LIMIT - selected.size), 'f.updated_at DESC, RANDOM()')
     fill(TANK_VIEW_LIMIT - selected.size, 'RANDOM()')
-    return c.json({ fish: [...selected.values()].map(row => presentFish(row, time)) })
+    return c.json({ fish: [...selected.values()].map(row => presentFish(row, time)), goldenFeast: activeFeast(time) })
+  })
+
+  api.get('/tank/leaderboard', c => {
+    const time = now()
+    function top(order: string, ...params: string[]) {
+      const rows = db.prepare(`${fishSelect} WHERE ${inTank} ORDER BY ${order}, f.id LIMIT 5`).all(...params) as FishRow[]
+      return rows.map(row => presentFish(row, time))
+    }
+    return c.json({
+      gluttons: top('CASE WHEN f.daily_eats_date = ? THEN f.daily_eats_count ELSE 0 END DESC, f.experience DESC', shanghaiDate(time)),
+      bullies: top('f.total_knockouts DESC, f.brawn DESC'),
+      giants: top('f.experience DESC, f.created_at'),
+    })
+  })
+
+  api.post('/tank/knockout', async c => {
+    requireKeeper(c)
+    const { attackerFishId, victimFishId } = await readBody(c)
+    if (typeof attackerFishId !== 'string' || !safeId.test(attackerFishId) ||
+        typeof victimFishId !== 'string' || !safeId.test(victimFishId) || attackerFishId === victimFishId) {
+      fail(400, '请选择两条不同的鱼')
+    }
+    const time = now()
+    useRateLimit(c, 'knockout', String(Math.floor(time / 60_000)), 40)
+    const { fish, victim } = transaction(() => {
+      const attacker = activeFish(attackerFishId)
+      const victim = activeFish(victimFishId)
+      db.prepare('UPDATE fish SET total_knockouts = total_knockouts + 1 WHERE id = ?').run(attacker.id)
+      return { fish: presentFish(findFish(attacker.id)!, time), victim }
+    })
+    broadcast('fish_updated', { fish })
+    ticker('knockout', `💥 ${fish.name} 把 ${victim.name} 撞晕了！`, fish.id, time)
+    return c.json({ fish })
   })
 
   api.get('/fish/search', c => {
@@ -255,14 +339,23 @@ export function createApp(options: Options) {
       SELECT consumed_at AS consumedAt, outcome FROM pellets
       WHERE winner_fish_id = ? AND status = 'consumed' ORDER BY consumed_at DESC, rowid DESC LIMIT 10
     `).all(fish.id) as unknown as FeedingRecord[]
-    return c.json({ fish: { ...presentFish(fish, now()), feedingHistory } })
+    const { totalEats } = db.prepare(`
+      SELECT (SELECT COUNT(*) FROM pellets WHERE winner_fish_id = ? AND status = 'consumed') +
+        (SELECT COUNT(*) FROM golden_feasts WHERE winner_fish_id = ? AND status = 'consumed') AS totalEats
+    `).get(fish.id, fish.id) as { totalEats: number }
+    return c.json({ fish: { ...presentFish(fish, now()), feedingHistory, totalEats } })
   })
 
   api.post('/fish', async c => {
     const keeper = requireKeeper(c)
-    const { name, pngBase64 } = await readBody(c)
+    const { name, pngBase64, eyes: rawEyes, tagline: rawTagline = '' } = await readBody(c)
     const fishName = shortName(name)
     if (!fishName) fail(400, '鱼名需要 1～16 字')
+    const eyes = validateEyes(rawEyes)
+    if (!eyes) fail(400, '活眼球参数无效，最多可放置 4 只')
+    if (typeof rawTagline !== 'string') fail(400, '口头禅需要是文字，最多 12 字')
+    const tagline = rawTagline.trim()
+    if ([...tagline].length > 12 || /\p{Cc}/u.test(tagline)) fail(400, '口头禅最多 12 字，且不能包含控制字符')
     const artwork = parseArtwork(pngBase64)
     if (!artwork) fail(400, `鱼图需为透明 PNG，最长边不超过 ${MAX_ART_EDGE} 像素，体积不超过 ${MAX_ART_BYTES / 1024} KB`)
     const id = randomUUID()
@@ -276,8 +369,8 @@ export function createApp(options: Options) {
         if (count >= MAX_ACTIVE_FISH_PER_KEEPER) fail(409, '在缸鱼已满，请先深海归档一条鱼')
         wroteFile = true
         writeFileSync(path, artwork, { flag: 'wx' })
-        db.prepare('INSERT INTO fish(id, keeper_id, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
-          .run(id, keeper.id, fishName, time, time)
+        db.prepare('INSERT INTO fish(id, keeper_id, name, created_at, updated_at, eyes_json, tagline) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .run(id, keeper.id, fishName, time, time, JSON.stringify(eyes), tagline)
       })
     } catch (error) {
       if (wroteFile && (error as NodeJS.ErrnoException).code !== 'EEXIST') rmSync(path, { force: true })
@@ -363,14 +456,20 @@ export function createApp(options: Options) {
   })
 
   api.delete('/admin/fish/:id', c => {
-    const expected = Buffer.from(options.adminSecret ?? '')
-    const provided = Buffer.from(c.req.header('X-Admin-Secret') ?? '')
-    if (!expected.length || provided.length !== expected.length || !timingSafeEqual(provided, expected)) fail(403, '无管理员权限')
+    requireAdmin(c)
     const id = c.req.param('id')
     const result = db.prepare('UPDATE fish SET is_hidden = 1 WHERE id = ?').run(id)
     if (!result.changes) fail(404, '找不到这条鱼')
     broadcast('fish_hidden', { fishId: id })
     return c.json({ hidden: true })
+  })
+
+  api.post('/admin/golden-feast', c => {
+    requireAdmin(c)
+    const time = now()
+    const { goldenFeast, spawned } = transaction(() => spawnFeast(time))
+    if (spawned) broadcast('golden_feast_spawned', { goldenFeast })
+    return c.json({ goldenFeast }, spawned ? 201 : 200)
   })
 
   api.post('/pellets/drop', async c => {
@@ -406,27 +505,23 @@ export function createApp(options: Options) {
         db.prepare("UPDATE pellets SET status = 'expired' WHERE id = ?").run(pelletId)
         return null
       }
-      const row = findFish(winnerFishId)
-      if (!row || row.status !== 'active' || row.is_hidden) fail(409, '这条鱼已离开公共鱼缸')
-      const next = feedFish({
-        experience: row.experience, dailyFedCount: row.daily_fed_count, dailyFedDate: row.daily_fed_date,
-        rawStuffedStacks: row.stuffed_stacks, stuffedUpdatedAt: row.stuffed_updated_at,
-      }, time)
-      if (!next) fail(409, '这条鱼撑不动了')
-      db.prepare(`UPDATE fish SET experience = ?, daily_fed_count = ?, daily_fed_date = ?,
-        stuffed_stacks = ?, stuffed_updated_at = ?, updated_at = ? WHERE id = ?`)
-        .run(next.experience, next.dailyFedCount, next.dailyFedDate, next.rawStuffedStacks, next.stuffedUpdatedAt, time, row.id)
+      const row = activeFish(winnerFishId)
+      const { fish, outcome, levelDelta } = settleFish(row, time, feedFish)
       db.prepare(`UPDATE pellets SET status = 'consumed', consumed_date = ?, consumed_at = ?, winner_fish_id = ?, outcome = ?
-        WHERE id = ?`).run(shanghaiDate(time), time, row.id, next.outcome, pelletId)
+        WHERE id = ?`).run(shanghaiDate(time), time, row.id, outcome, pelletId)
+      const { value } = db.prepare("UPDATE tank_state SET value = value + 1 WHERE key = 'normal_feeds_total' RETURNING value")
+        .get() as { value: number }
       return {
-        outcome: next.outcome, fish: presentFish(findFish(row.id)!, time),
-        remainingRations: rations(keeper.id, time), levelDelta: next.levelDelta,
+        claim: { outcome, fish, remainingRations: rations(keeper.id, time), levelDelta },
+        feast: value % GOLDEN_FEAST_EVERY_FEEDS === 0 ? spawnFeast(time) : null,
       }
     })
     if (!result) fail(409, '这颗鱼食已失效')
-    const { fish, outcome, levelDelta } = result
+    const { fish, outcome, levelDelta } = result.claim
     broadcast('pellet_consumed', { pelletId, fish, outcome, levelDelta })
-    return c.json(result)
+    if (outcome === 'stuffed_full') ticker('stuffed', `🫧 ${fish.name} 彻底吃撑翻肚皮了！`, fish.id, time)
+    if (result.feast?.spawned) broadcast('golden_feast_spawned', { goldenFeast: result.feast.goldenFeast })
+    return c.json(result.claim)
   })
 
   api.post('/pellets/:pelletId/cancel', c => {
@@ -438,6 +533,25 @@ export function createApp(options: Options) {
         .run(pellet.expires_at > time ? 'cancelled' : 'expired', pellet.id)
     }
     return c.json({ remainingRations: rations(keeper.id, time) })
+  })
+
+  api.post('/golden-feast/:id/claim', async c => {
+    requireKeeper(c)
+    const { winnerFishId } = await readBody(c)
+    if (typeof winnerFishId !== 'string' || !safeId.test(winnerFishId)) fail(400, '需要指定有效的鱼')
+    const feastId = c.req.param('id')
+    const time = now()
+    const result = transaction(() => {
+      if (activeFeast(time)?.id !== feastId) fail(409, '这颗黄金大餐已失效')
+      const row = activeFish(winnerFishId)
+      const { fish, outcome, levelDelta } = settleFish(row, time, applyGoldenFeast)
+      db.prepare("UPDATE golden_feasts SET status = 'consumed', winner_fish_id = ?, consumed_at = ? WHERE id = ?")
+        .run(row.id, time, feastId)
+      return { feastId, fish, outcome, levelDelta, xpGained: fish.experience - row.experience }
+    })
+    broadcast('golden_feast_consumed', result)
+    ticker('golden_feast', `👑 ${result.fish.name} 抢走了天降黄金大餐！`, result.fish.id, time)
+    return c.json(result)
   })
 
   api.get('/events', c => {

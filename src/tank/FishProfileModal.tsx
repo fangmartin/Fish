@@ -1,17 +1,15 @@
 import { useEffect, useState } from 'react'
 import type { Fish, FishProfile } from '../../shared/contracts'
 import {
-  DAILY_SATIETY_CAP, EMPTY_STATS, MAX_STAT_VALUE, STAT_KEYS, canRespec, dailyCount, getDigestionState, type Stats,
+  DAILY_SATIETY_CAP, EMPTY_STATS, MAX_STAT_VALUE, STAT_KEYS, canRespec, dailyCount, getBuildTitle, getDigestionState, type Stats,
 } from '../../shared/domain'
 import { api, copyText } from '../api'
 import { Icon } from '../icons'
 import { Modal } from '../Modal'
 import { FishPreview } from './FishPreview'
+import { downloadFishPoster, statNames } from './poster'
 
 const stageNames = { fry: '鱼苗', juvenile: '幼鱼', adult: '成鱼', leviathan: '鱼王' }
-const statNames: Record<keyof Stats, string> = {
-  burst: '爆发力', stamina: '耐力', sense: '感知力', agility: '灵巧度', brawn: '冲撞力',
-}
 const outcomeNames = { grew: '成长', leveled_up: '升级', stuffed: '吃撑', stuffed_full: '撑不动了' }
 const clock = new Intl.DateTimeFormat('zh-CN', {
   timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
@@ -31,6 +29,7 @@ export function FishProfileModal({ id, live, keeperId, onClose, onChange, onRepo
   const [feedback, setFeedback] = useState('')
   const [increments, setIncrements] = useState<Stats>({ ...EMPTY_STATS })
   const [busy, setBusy] = useState(false)
+  const [savingPoster, setSavingPoster] = useState(false)
   const [archiveConfirm, setArchiveConfirm] = useState(false)
   const [wallTime, setWallTime] = useState(Date.now)
   const [receivedAt, setReceivedAt] = useState(Date.now)
@@ -58,7 +57,7 @@ export function FishProfileModal({ id, live, keeperId, onClose, onChange, onRepo
     try {
       const { fish } = await change()
       setReceivedAt(Date.now())
-      setProfile(previous => ({ ...fish, feedingHistory: previous?.feedingHistory ?? [] }))
+      setProfile(previous => ({ ...fish, feedingHistory: previous?.feedingHistory ?? [], totalEats: previous?.totalEats ?? 0 }))
       setIncrements({ ...EMPTY_STATS })
       setArchiveConfirm(false)
       onChange(fish)
@@ -81,6 +80,20 @@ export function FishProfileModal({ id, live, keeperId, onClose, onChange, onRepo
   const available = fish.unspentPoints - STAT_KEYS.reduce((sum, key) => sum + increments[key], 0)
   const share = new URL(window.location.pathname, window.location.origin)
   share.searchParams.set('fish', fish.id)
+  const posterFish = { ...profile, ...fish }
+
+  async function savePoster() {
+    setSavingPoster(true)
+    setError('')
+    setFeedback('')
+    try {
+      await downloadFishPoster(posterFish, share.href)
+    } catch {
+      setError('海报暂时无法生成，请重试')
+    } finally {
+      setSavingPoster(false)
+    }
+  }
 
   async function report() {
     if (!keeperId) { setError('请先设置养鱼人昵称，再提交举报'); return }
@@ -100,7 +113,11 @@ export function FishProfileModal({ id, live, keeperId, onClose, onChange, onRepo
 
   return <Modal title={fish.name} onClose={onClose}>
     <FishPreview fish={fish} stuffed={digestion.stuffedStacks} />
-    <div className="profile-meta"><span>{fish.nickname} · {stageNames[fish.stage]}</span><strong>Lv.{fish.level}</strong></div>
+    <div className="profile-meta">
+      <span>{fish.nickname} · {stageNames[fish.stage]}</span>
+      <span className="build-badge">{getBuildTitle(fish.stats, fish.level)}</span><strong>Lv.{fish.level}</strong>
+    </div>
+    {fish.tagline && <p className="profile-tagline">「{fish.tagline}」</p>}
     <div className="progress-header"><span>成长经验</span><strong>{fish.nextLevelXp ? `${fish.progress} / ${fish.nextLevelXp}` : '已满级'}</strong></div>
     <progress className="growth-progress" value={fish.nextLevelXp ? fish.progress : 1} max={fish.nextLevelXp || 1} aria-label="成长经验" />
     <div className="profile-satiety">
@@ -143,6 +160,8 @@ export function FishProfileModal({ id, live, keeperId, onClose, onChange, onRepo
     {error && <p className="form-error" role="alert">{error}</p>}
     {feedback && <p className="feedback" role="status">{feedback}</p>}
     <footer className="profile-actions">
+      <button className="button primary" disabled={savingPoster} onClick={() => void savePoster()}>
+        <Icon name="download" /> {savingPoster ? '正在生成…' : '保存晒图'}</button>
       <button className="button subtle" onClick={() => void copyText(share.href).then(() => setFeedback('直达链接已复制'))
         .catch(() => setFeedback(share.href))}><Icon name="copy" /> 复制链接</button>
       {fish.status === 'active' && !fish.isHidden && <button className="button subtle" disabled={busy} onClick={() => void report()}>

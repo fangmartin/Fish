@@ -1,10 +1,12 @@
-import type { FeedOutcome, GrowthStage, Stats, StuffedStacks } from './domain'
+import type { FeedOutcome, FishEye, GrowthStage, Stats, StuffedStacks } from './domain'
 
 export interface Fish {
   id: string
   keeperId: string
   nickname: string
   name: string
+  tagline: string
+  eyes: FishEye[]
   assetUrl: string
   isSystem: boolean
   isHidden: boolean
@@ -21,6 +23,8 @@ export interface Fish {
   lastRespecDate: string | null
   dailyFedCount: number
   dailyFedDate: string | null
+  dailyEatsCount: number
+  totalKnockouts: number
   rawStuffedStacks: number
   stuffedStacks: StuffedStacks
   stuffedUpdatedAt: number
@@ -35,6 +39,14 @@ export interface FeedingRecord {
 
 export interface FishProfile extends Fish {
   feedingHistory: FeedingRecord[]
+  totalEats: number
+}
+
+export interface FishRelease {
+  name: string
+  pngBase64: string
+  eyes: FishEye[]
+  tagline: string
 }
 
 export interface Keeper {
@@ -65,10 +77,48 @@ export interface Claim {
   levelDelta: number
 }
 
+export interface GoldenFeast {
+  id: string
+  x: number
+  y: number
+  createdAt: number
+  expiresAt: number
+}
+
+export interface GoldenFeastClaim {
+  feastId: string
+  fish: Fish
+  outcome: FeedOutcome
+  levelDelta: number
+  xpGained: number
+}
+
+export interface TankView {
+  fish: Fish[]
+  goldenFeast: GoldenFeast | null
+}
+
+export interface Leaderboard {
+  gluttons: Fish[]
+  bullies: Fish[]
+  giants: Fish[]
+}
+
+export interface TankTicker {
+  id: string
+  kind: 'knockout' | 'stuffed' | 'golden_feast'
+  text: string
+  fishId: string
+  createdAt: number
+}
+
 export interface TankEvents {
   fish_released: { fish: Fish }
   fish_archived: { fishId: string }
   fish_hidden: { fishId: string }
   fish_updated: { fish: Fish }
   pellet_consumed: { pelletId: string; fish: Fish; outcome: FeedOutcome; levelDelta: number }
+  golden_feast_spawned: { goldenFeast: GoldenFeast }
+  golden_feast_consumed: GoldenFeastClaim
+  tank_ticker: TankTicker
 }

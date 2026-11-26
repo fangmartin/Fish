@@ -1,4 +1,4 @@
-type Sound = 'drop' | 'eat' | 'level' | 'burp' | 'release'
+type Sound = 'drop' | 'eat' | 'level' | 'burp' | 'release' | 'bonk' | 'knock' | 'feast'
 let audio: AudioContext | undefined
 let muted = false
 
@@ -24,6 +24,10 @@ export function playSound(sound: Sound) {
     level: [[392, 392, 0, 0.43, 'sine'], [494, 494, 0.08, 0.42, 'sine'], [587, 587, 0.16, 0.53, 'sine']],
     burp: [[122, 66, 0, 0.36, 'triangle']],
     release: [[246, 85, 0, 0.35, 'sine'], [820, 460, 0.085, 0.27, 'sine']],
+    bonk: [[192, 58, 0, 0.16, 'triangle'], [345, 155, 0.012, 0.12, 'sine']],
+    knock: [[420, 160, 0, 0.13, 'triangle'], [475, 195, 0.105, 0.16, 'triangle']],
+    feast: [[523, 523, 0, 0.28, 'sine'], [659, 659, 0.07, 0.33, 'sine'],
+      [784, 784, 0.14, 0.39, 'sine'], [1047, 1055, 0.22, 0.49, 'triangle']],
   }
   for (const [startPitch, endPitch, delay, duration, shape] of patterns[sound]) {
     const start = audio.currentTime + delay

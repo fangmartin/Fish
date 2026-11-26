@@ -1,5 +1,5 @@
 import { useEffect, useEffectEvent, useRef, useState } from 'react'
-import type { Fish, KeeperResponse, TankEvents } from '../shared/contracts'
+import type { Fish, FishRelease, GoldenFeast, GoldenFeastClaim, KeeperResponse, TankEvents, TankTicker } from '../shared/contracts'
 import { DAILY_RATION_LIMIT, PELLET_LIFETIME_MS, TANK_VIEW_LIMIT, getDigestionState } from '../shared/domain'
 import { api } from './api'
 import { playSound, setSoundMuted, unlockSound } from './audio/sound'
@@ -7,16 +7,31 @@ import { Icon } from './icons'
 import { KeeperModal } from './KeeperModal'
 import { Studio } from './studio/Studio'
 import { FishProfileModal } from './tank/FishProfileModal'
+import { LeaderboardModal } from './tank/LeaderboardModal'
 import { TankCanvas, type LocalPellet, type TankEffect } from './tank/TankCanvas'
+import type { TideMode } from './tank/ambient'
+import type { CollisionEvent } from './tank/physics'
 
 const unloaded: KeeperResponse = { keeper: null }
 const dailyRations = DAILY_RATION_LIMIT
 const soundKey = 'fish-sound-muted'
+const tideKey = 'fish-tide-mode'
+const tideModes: TideMode[] = ['auto', 'dawn', 'day', 'dusk', 'night']
+const tideLabels: Record<TideMode, string> = { auto: '自动昼夜', dawn: '清晨', day: '午后', dusk: '黄昏', night: '深夜' }
 const startingFocus = new URLSearchParams(window.location.search).get('fish') ?? ''
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : '暂时无法连接鱼缸'
 
 function savedMute() {
   try { return localStorage.getItem(soundKey) === 'true' } catch { return false }
+}
+
+function savedTide(): TideMode {
+  try {
+    const saved = localStorage.getItem(tideKey)
+    return tideModes.find(mode => mode === saved) ?? 'auto'
+  } catch {
+    return 'auto'
+  }
 }
 
 export function App() {
@@ -37,10 +52,18 @@ export function App() {
   const [searching, setSearching] = useState(false)
   const [toast, setToast] = useState('')
   const [viewLoading, setViewLoading] = useState(false)
+  const [leaderboard, setLeaderboard] = useState(false)
+  const [ticker, setTicker] = useState<TankTicker | null>(null)
+  const [goldenFeast, setGoldenFeast] = useState<GoldenFeast | null>(null)
+  const [tideMode, setTideMode] = useState<TideMode>(savedTide)
 
   const pellets = useRef(new Map<string, LocalPellet>())
   const localDrops = useRef(new Map<string, number>())
   const effects = useRef<TankEffect[]>([])
+  const recentKnockouts = useRef(new Map<string, number>())
+  const celebratedFeasts = useRef(new Map<string, number>())
+  const feastVersion = useRef(0)
+  const feastRequest = useRef({ id: '', busy: false, retryAt: 0 })
   const waterEpoch = useRef(0)
   const viewRequest = useRef(0)
   const keeperRequest = useRef(0)
@@ -63,10 +86,12 @@ export function App() {
 
   async function loadView(nextFocus: string, exclude: string[] = []) {
     const request = ++viewRequest.current
+    const version = feastVersion.current
     const result = await api.tank(nextFocus, exclude)
     if (request !== viewRequest.current) return
     setLoaded(true)
     setFish(result.fish)
+    if (version === feastVersion.current) setGoldenFeast(result.goldenFeast)
     if (nextFocus && !result.fish.some(item => item.id === nextFocus)) setSpotlight('')
     return result.fish
   }
@@ -113,6 +138,7 @@ export function App() {
       // A small shared tank has no alternate slice, so keep its available fish visible.
       const excludes = shuffle && fish.length >= TANK_VIEW_LIMIT ? fish.map(item => item.id) : []
       const request = ++viewRequest.current
+      const version = feastVersion.current
       let result = await api.tank(id, excludes)
       if (excludes.length && result.fish.length < TANK_VIEW_LIMIT) {
         const fallback = await api.tank(id)
@@ -121,11 +147,12 @@ export function App() {
           if (byId.size >= TANK_VIEW_LIMIT) break
           if (!byId.has(item.id)) byId.set(item.id, item)
         }
-        result = { fish: [...byId.values()] }
+        result = { ...fallback, fish: [...byId.values()] }
       } else requestedExclusions.current = excludes
       if (request !== viewRequest.current || epoch !== waterEpoch.current) return
       setLoaded(true)
       setFish(result.fish)
+      if (version === feastVersion.current) setGoldenFeast(result.goldenFeast)
       if (id && result.fish.some(item => item.id === id)) markSpotlight(id)
       else setSpotlight('')
     } catch (error) {
@@ -140,6 +167,7 @@ export function App() {
   }
 
   function selectFish(item: Fish) {
+    setLeaderboard(false)
     setQuery('')
     setSearchOpen(false)
     setProfileId(item.id)
@@ -203,7 +231,7 @@ export function App() {
       const stillHere = pellets.current.delete(id)
       applyFish(result.fish)
       if (stillHere) {
-        effects.current.push({ fishId, outcome: result.outcome })
+        enqueueEffect({ fishId, outcome: result.outcome })
         playSound(result.outcome === 'leveled_up' ? 'level' : result.outcome === 'grew' ? 'eat' : 'burp')
       }
       void refreshKeeper().catch(() => {})
@@ -217,15 +245,61 @@ export function App() {
     }
   }
 
+  function enqueueEffect(effect: TankEffect) {
+    if (effects.current.length >= 24) effects.current.shift()
+    effects.current.push(effect)
+  }
+
+  function reportKnockout({ attackerId, victimId }: CollisionEvent) {
+    if (!ownerId.current) return
+    const key = [attackerId, victimId].sort().join(':')
+    const now = Date.now()
+    if ((recentKnockouts.current.get(key) ?? 0) > now) return
+    recentKnockouts.current.set(key, now + 3000)
+    void api.knockout(attackerId, victimId).then(({ fish }) => applyFish(fish)).catch(() => {})
+  }
+
+  function celebrateFeast(result: GoldenFeastClaim) {
+    if (celebratedFeasts.current.has(result.feastId)) return
+    celebratedFeasts.current.set(result.feastId, Date.now() + 120_000)
+    feastVersion.current++
+    setGoldenFeast(current => current?.id === result.feastId ? null : current)
+    applyFish(result.fish)
+    enqueueEffect({ fishId: result.fish.id, outcome: result.outcome, xpGained: result.xpGained, golden: true })
+    playSound('feast')
+  }
+
+  async function claimFeast(id: string, fishId: string) {
+    if (!ownerId.current || celebratedFeasts.current.has(id)) return
+    const previous = feastRequest.current
+    if (previous.id === id && (previous.busy || previous.retryAt > Date.now())) return
+    const attempt = { id, busy: true, retryAt: 0 }
+    feastRequest.current = attempt
+    try {
+      celebrateFeast(await api.claimFeast(id, fishId))
+    } catch {
+      attempt.retryAt = Date.now() + 900
+      const version = feastVersion.current
+      const result = await api.tank(focus.current, requestedExclusions.current).catch(() => null)
+      if (result && version === feastVersion.current) {
+        setGoldenFeast(result.goldenFeast)
+        const updated = result.fish.find(fish => fish.id === fishId)
+        if (updated) applyFish(updated)
+      }
+    } finally {
+      attempt.busy = false
+    }
+  }
+
   async function onIdentity() {
     await refreshKeeper()
     const currentFish = await loadView(focus.current)
     if (identity === 'food' && canFeedView(currentFish)) setFeeding(true)
   }
 
-  async function release(name: string, pngBase64: string) {
+  async function release(art: FishRelease) {
     unlockSound()
-    const result = await api.release(name, pngBase64)
+    const result = await api.release(art)
     applyFish(result.fish, true)
     setStudio(false)
     markSpotlight(result.fish.id)
@@ -243,10 +317,8 @@ export function App() {
       })
     }
     eventSource.addEventListener('ready', () => {
-      if (ready) {
-        void loadView(focus.current, requestedExclusions.current).catch(() => {})
-        void refreshKeeper().catch(() => {})
-      }
+      void loadView(focus.current, requestedExclusions.current).catch(error => setToast(errorMessage(error)))
+      if (ready) void refreshKeeper().catch(() => {})
       ready = true
     })
     on('fish_released', ({ fish }) => applyFish(fish, true))
@@ -255,8 +327,15 @@ export function App() {
     on('fish_updated', ({ fish }) => applyFish(fish))
     on('pellet_consumed', ({ pelletId, fish, outcome }) => {
       applyFish(fish)
-      if (!localDrops.current.has(pelletId)) effects.current.push({ fishId: fish.id, outcome })
+      if (!localDrops.current.has(pelletId)) enqueueEffect({ fishId: fish.id, outcome })
     })
+    on('golden_feast_spawned', ({ goldenFeast }) => {
+      if (celebratedFeasts.current.has(goldenFeast.id)) return
+      feastVersion.current++
+      setGoldenFeast(goldenFeast)
+    })
+    on('golden_feast_consumed', celebrateFeast)
+    on('tank_ticker', setTicker)
     void loadView(startingFocus).catch(error => setToast(errorMessage(error)))
     void refreshKeeper().catch(() => {})
 
@@ -270,6 +349,12 @@ export function App() {
       for (const [id, expiresAt] of localDrops.current) {
         if (expiresAt <= now) localDrops.current.delete(id)
       }
+      for (const [key, expiresAt] of recentKnockouts.current) {
+        if (expiresAt <= now) recentKnockouts.current.delete(key)
+      }
+      for (const [id, expiresAt] of celebratedFeasts.current) {
+        if (expiresAt <= now) celebratedFeasts.current.delete(id)
+      }
       if (expired) void refreshKeeper().catch(() => {})
     }
     const expiry = window.setInterval(checkRations, 1200)
@@ -277,9 +362,11 @@ export function App() {
       if (ownerId.current) void refreshKeeper().catch(() => {})
     }, 20_000)
     window.addEventListener('pagehide', leave)
+    window.addEventListener('pointerdown', unlockSound, { once: true })
     return () => {
       eventSource.close()
       window.removeEventListener('pagehide', leave)
+      window.removeEventListener('pointerdown', unlockSound)
       window.clearInterval(expiry)
       window.clearInterval(refresh)
       window.clearTimeout(defocus.current)
@@ -291,6 +378,16 @@ export function App() {
     setSoundMuted(muted)
     try { localStorage.setItem(soundKey, String(muted)) } catch { /* Sound still works without persistence. */ }
   }, [muted])
+
+  useEffect(() => {
+    try { localStorage.setItem(tideKey, tideMode) } catch { /* The selected mode still applies. */ }
+  }, [tideMode])
+
+  useEffect(() => {
+    if (!ticker) return
+    const hide = window.setTimeout(() => setTicker(null), 5000)
+    return () => window.clearTimeout(hide)
+  }, [ticker])
 
   useEffect(() => {
     if (!toast) return
@@ -313,7 +410,7 @@ export function App() {
 
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
-      if (event.key !== 'Escape' || identity || profileId || studio) return
+      if (event.key !== 'Escape' || identity || profileId || studio || leaderboard) return
       if (immersive) setImmersive(false)
       else if (searchOpen) setSearchOpen(false)
       else setFeeding(false)
@@ -324,7 +421,7 @@ export function App() {
     window.addEventListener('keydown', onKey)
     window.addEventListener('pointerdown', outside)
     return () => { window.removeEventListener('keydown', onKey); window.removeEventListener('pointerdown', outside) }
-  }, [identity, profileId, immersive, searchOpen, studio])
+  }, [identity, profileId, immersive, searchOpen, studio, leaderboard])
 
   const profile = fish.find(item => item.id === profileId)
   const keeperId = keeper.keeper?.id
@@ -333,6 +430,7 @@ export function App() {
   return <>
     <main className="tank-page" hidden={studio}>
       <TankCanvas fish={fish} keeperId={keeperId} feeding={feeding} spotlight={spotlight} pellets={pellets.current} effects={effects.current}
+        goldenFeast={goldenFeast} tideMode={tideMode} onKnockout={reportKnockout} onGoldenContact={(id, winner) => void claimFeast(id, winner)}
         onWaterClick={(x, y) => void drop(x, y)} onFishClick={setProfileId} onContact={(id, winner) => void claim(id, winner)} />
       {!immersive && <>
         <header className="tank-header">
@@ -358,6 +456,14 @@ export function App() {
               </div>}
             </div>
             <button className="icon-button" aria-label="定位我的鱼" title="定位我的鱼" onClick={() => void locateOwn()} disabled={viewLoading}><Icon name="locate" /></button>
+            <button className="button subtle tank-utility" aria-label="排行榜" title="排行榜" onClick={() => setLeaderboard(true)}>
+              <Icon name="trophy" /> <span>排行榜</span>
+            </button>
+            <button className="button subtle tank-utility" aria-label={`昼夜氛围 · ${tideLabels[tideMode]}`}
+              title={`切换昼夜氛围 · ${tideLabels[tideMode]}`}
+              onClick={() => setTideMode(tideModes[(tideModes.indexOf(tideMode) + 1) % tideModes.length])}>
+              <Icon name="tide" /> <span>{tideLabels[tideMode]}</span>
+            </button>
           </div>
           <div className="tank-actions">
             <button className="icon-button" aria-label={muted ? '打开音效' : '静音'} title={muted ? '打开音效' : '静音'}
@@ -375,6 +481,7 @@ export function App() {
           </div>
         </header>
         {loaded && !fish.length && <div className="empty-tank"><Icon name="fish" /><p>成为第一个下水画鱼的人</p></div>}
+        {ticker && <div key={ticker.id} className="tank-ticker" role="status">{ticker.text}</div>}
         <footer className="tank-dock">
           <button className="feed-button" aria-pressed={feeding}
             onClick={() => {
@@ -398,6 +505,7 @@ export function App() {
         aria-label="退出沉浸模式" title="退出沉浸模式 (Esc)"><Icon name="expand" /></button>}
     </main>
     {studio && <Studio onClose={() => setStudio(false)} canRelease={!!keeperId} onNeedKeeper={() => setIdentity('release')} onRelease={release} />}
+    {leaderboard && <LeaderboardModal onClose={() => setLeaderboard(false)} onFish={selectFish} />}
     {identity && <KeeperModal state={keeper} message={identity === 'food' ? '先设置一个昵称，就可以撒食。' :
       identity === 'release' ? '设置昵称后，这幅手绘可以以你的名字下水。' : undefined} onClose={() => setIdentity(null)}
       onIdentity={onIdentity} onFish={id => { setIdentity(null); setProfileId(id) }} />}
