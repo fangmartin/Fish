@@ -1,0 +1,359 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="980" viewBox="0 0 1440 980"
+     role="img" aria-labelledby="title description">
+  <title id="title">潮汐鱼缸 · 版本更新全景图</title>
+  <desc id="description">从 MVP 到四次正式迭代。画室创作将鱼放生入缸，鱼缸饱腹反馈帮助玩家选择投喂时机，在线鱼食罐提供鱼食，进食结算驱动六维养成，成长状态再同步到公共鱼缸。下方列出生产环境的 HTTPS、SSE、镜像与迁移底座。</desc>
+
+  <defs>
+    <linearGradient id="ocean" x1="0" y1="0" x2="1" y2="1" gradientUnits="objectBoundingBox">
+      <stop stop-color="#091e31"/>
+      <stop offset=".48" stop-color="#071e2b"/>
+      <stop offset="1" stop-color="#061322"/>
+    </linearGradient>
+    <radialGradient id="aurora">
+      <stop stop-color="#2cc7bb" stop-opacity=".23"/>
+      <stop offset=".54" stop-color="#2cbab8" stop-opacity=".10"/>
+      <stop offset="1" stop-color="#2cbab8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="violet-glow">
+      <stop stop-color="#9b83ff" stop-opacity=".18"/>
+      <stop offset="1" stop-color="#9b83ff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="warm-glow">
+      <stop stop-color="#ffcf7d" stop-opacity=".22"/>
+      <stop offset="1" stop-color="#ffcf7d" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="beam" x1="0" y1="0" x2=".65" y2="1">
+      <stop stop-color="#92f0e6" stop-opacity=".15"/>
+      <stop offset="1" stop-color="#92f0e6" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2=".82" y2="1">
+      <stop stop-color="#213e53" stop-opacity=".88"/>
+      <stop offset="1" stop-color="#102839" stop-opacity=".94"/>
+    </linearGradient>
+    <linearGradient id="glass-teal" x1="0" y1="0" x2=".9" y2="1">
+      <stop stop-color="#184542" stop-opacity=".81"/>
+      <stop offset="1" stop-color="#102a3a" stop-opacity=".96"/>
+    </linearGradient>
+    <linearGradient id="glass-plum" x1="0" y1="0" x2=".9" y2="1">
+      <stop stop-color="#31364f" stop-opacity=".86"/>
+      <stop offset="1" stop-color="#172840" stop-opacity=".97"/>
+    </linearGradient>
+    <linearGradient id="glass-blue" x1="0" y1="0" x2=".88" y2="1">
+      <stop stop-color="#214057" stop-opacity=".92"/>
+      <stop offset="1" stop-color="#112a40" stop-opacity=".96"/>
+    </linearGradient>
+    <linearGradient id="fish-body" x1="0" y1="0" x2=".9" y2="1">
+      <stop stop-color="#a6f5db"/>
+      <stop offset=".58" stop-color="#50c8bd"/>
+      <stop offset="1" stop-color="#318fab"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2=".88" y2="1">
+      <stop stop-color="#fff2be"/>
+      <stop offset=".59" stop-color="#ffd57b"/>
+      <stop offset="1" stop-color="#d8933d"/>
+    </linearGradient>
+    <linearGradient id="bottle" x1="0" y1="0" x2="1" y2=".78">
+      <stop stop-color="#78e2d2" stop-opacity=".28"/>
+      <stop offset="1" stop-color="#2b7c88" stop-opacity=".43"/>
+    </linearGradient>
+    <marker id="arrow-mint" viewBox="0 0 10 10" refX="8.7" refY="5" markerWidth="8" markerHeight="8"
+            orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M1 1L9 5 1 9Z" fill="#8cf0d6"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8.7" refY="5" markerWidth="8" markerHeight="8"
+            orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M1 1L9 5 1 9Z" fill="#a3d8ff"/>
+    </marker>
+    <marker id="arrow-lavender" viewBox="0 0 10 10" refX="8.7" refY="5" markerWidth="8" markerHeight="8"
+            orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M1 1L9 5 1 9Z" fill="#c6b5ff"/>
+    </marker>
+    <style>
+      svg { fill: #ebf8f8; }
+      text { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; }
+      .brand { font-size: 13px; letter-spacing: 2.2px; font-weight: 650; fill: #98d9d9; }
+      .title { font-size: 49px; font-weight: 750; letter-spacing: .7px; }
+      .subtitle { font-size: 17px; fill: #b2cbd3; }
+      .badge { font-size: 14px; font-weight: 650; }
+      .timeline-label { font-size: 16px; font-weight: 650; }
+      .hash { font-size: 13px; font-weight: 620; letter-spacing: .6px; }
+      .section { font-size: 19px; font-weight: 720; letter-spacing: .5px; }
+      .card-title { font-size: 26px; font-weight: 720; }
+      .topic { font-size: 16px; font-weight: 690; }
+      .body { font-size: 16px; fill: #d4e9ec; }
+      .flow-label { font-size: 14px; font-weight: 650; }
+      .platform-label { font-size: 16px; font-weight: 690; }
+      .platform-detail { font-size: 14.5px; fill: #b8d3e0; }
+    </style>
+  </defs>
+
+  <!-- Underwater lighting -->
+  <g id="background" aria-hidden="true">
+    <rect width="1440" height="980" fill="url(#ocean)"/>
+    <ellipse cx="518" cy="280" rx="518" ry="280" fill="url(#aurora)"/>
+    <ellipse cx="1087" cy="722" rx="353" ry="244" fill="url(#violet-glow)" opacity=".85"/>
+    <path d="M292 0H351L536 533 384 408Z M425 0H479L721 453 554 365Z M579 0H621L883 401 738 346Z" fill="url(#beam)" opacity=".60"/>
+    <path d="M17 85C154 44 273 44 404 81S660 115 798 65 1085 23 1227 64 1387 83 1423 66"
+          fill="none" stroke="#75d2d3" stroke-opacity=".15" stroke-width="1.25"/>
+    <path d="M17 98C152 62 271 62 402 95S660 129 802 81 1088 41 1231 79 1388 95 1423 82"
+          fill="none" stroke="#75d2d3" stroke-opacity=".08" stroke-width="1.1"/>
+    <path d="M15 964C189 946 371 964 556 958S917 947 1093 955 1328 961 1425 952"
+          fill="none" stroke="#6cb6bd" stroke-opacity=".14" stroke-width="1"/>
+    <g fill="#a8f5df" opacity=".36">
+      <circle cx="38" cy="197" r="2"/><circle cx="40" cy="463" r="1.6"/><circle cx="1389" cy="221" r="2.2"/>
+      <circle cx="1401" cy="485" r="2.5"/><circle cx="31" cy="719" r="1.8"/><circle cx="1397" cy="735" r="1.5"/>
+      <circle cx="690" cy="313" r="1.3"/><circle cx="742" cy="463" r="1.8"/><circle cx="703" cy="622" r="1.2"/>
+      <circle cx="764" cy="758" r="2.1"/><circle cx="645" cy="758" r="1.4"/>
+    </g>
+    <g fill="none" stroke="#a4e4ec" stroke-opacity=".24" stroke-width="1">
+      <circle cx="25" cy="318" r="5"/><circle cx="33" cy="335" r="2.4"/><circle cx="1408" cy="306" r="4.5"/>
+      <circle cx="1401" cy="660" r="5"/><circle cx="1390" cy="645" r="2.6"/><circle cx="704" cy="298" r="4"/>
+      <circle cx="765" cy="597" r="5"/><circle cx="681" cy="758" r="3.6"/>
+    </g>
+  </g>
+
+  <g id="header">
+    <text x="66" y="54" class="brand">DRAW &amp; RAISE FISH</text>
+    <text x="64" y="111" class="title">潮汐鱼缸 · <tspan fill="#9cf5e1">版本更新全景图</tspan></text>
+    <text x="66" y="145" class="subtitle">自 MVP <tspan fill="#d2efee" font-weight="650">0a36480</tspan> 以来的 4 次正式迭代</text>
+
+    <g id="badge-tests">
+      <rect x="889" y="78" width="141" height="36" rx="18" fill="#153c39" fill-opacity=".92" stroke="#66c3a8" stroke-opacity=".55"/>
+      <text x="959.5" y="101" class="badge" text-anchor="middle" fill="#b4f3df">63 项测试通过</text>
+    </g>
+    <g id="badge-coverage">
+      <rect x="1040" y="78" width="145" height="36" rx="18" fill="#1b3c50" fill-opacity=".92" stroke="#7bb7e3" stroke-opacity=".55"/>
+      <text x="1112.5" y="101" class="badge" text-anchor="middle" fill="#c0e9ff">100% 领域覆盖</text>
+    </g>
+    <g id="badge-https">
+      <rect x="1195" y="78" width="181" height="36" rx="18" fill="#3c3a38" fill-opacity=".89" stroke="#dcb27a" stroke-opacity=".59"/>
+      <text x="1285.5" y="101" class="badge" text-anchor="middle" fill="#ffe0a2">双域名 HTTPS 线上运行</text>
+    </g>
+  </g>
+
+  <!-- Release timeline -->
+  <g id="timeline">
+    <rect x="64" y="166" width="1312" height="68" rx="17" fill="#102d3d" fill-opacity=".88" stroke="#6aabbc" stroke-opacity=".35"/>
+    <g id="milestone-https">
+      <circle cx="93" cy="199" r="7" fill="#85cbff" fill-opacity=".20"/>
+      <circle cx="93" cy="199" r="3" fill="#a3d8ff"/>
+      <text x="112" y="195" class="timeline-label">双域名 HTTPS 上线</text>
+      <text x="112" y="214" class="hash" fill="#a3d8ff">d95f311</text>
+    </g>
+    <g id="milestone-fun">
+      <circle cx="421" cy="199" r="7" fill="#8cf0d6" fill-opacity=".20"/>
+      <circle cx="421" cy="199" r="3" fill="#8cf0d6"/>
+      <text x="440" y="195" class="timeline-label">画室与鱼缸九项花活</text>
+      <text x="440" y="214" class="hash" fill="#8cf0d6">12d7e6c</text>
+    </g>
+    <g id="milestone-growth">
+      <circle cx="749" cy="199" r="7" fill="#c6b5ff" fill-opacity=".20"/>
+      <circle cx="749" cy="199" r="3" fill="#c6b5ff"/>
+      <text x="768" y="195" class="timeline-label">鱼肚容量、六维与 Lv.18</text>
+      <text x="768" y="214" class="hash" fill="#c6b5ff">7a6f8dd</text>
+    </g>
+    <g id="milestone-rations">
+      <circle cx="1077" cy="199" r="7" fill="#ffe1a1" fill-opacity=".20"/>
+      <circle cx="1077" cy="199" r="3" fill="#ffe1a1"/>
+      <text x="1096" y="195" class="timeline-label">20 颗在线补给鱼食罐</text>
+      <text x="1096" y="214" class="hash" fill="#ffe1a1">0b4bac5</text>
+    </g>
+    <g fill="none" stroke="#92bccc" stroke-opacity=".56" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M352 199h38m-7-6 7 6-7 6"/>
+      <path d="M680 199h38m-7-6 7 6-7 6"/>
+      <path d="M1008 199h38m-7-6 7 6-7 6"/>
+    </g>
+  </g>
+
+  <g id="section-title">
+    <rect x="64" y="255" width="4" height="16" rx="2" fill="#93efdb"/>
+    <text x="80" y="269" class="section">核心玩法闭环</text>
+    <path d="M220 263H1376" stroke="#85d8d4" stroke-opacity=".20" stroke-width="1"/>
+  </g>
+
+  <!-- Studio -->
+  <g id="card-studio">
+    <rect id="studio-panel" x="64" y="285" width="560" height="218" rx="22" fill="url(#glass-teal)" stroke="#80d5bf" stroke-opacity=".53" stroke-width="1.25"/>
+    <path d="M86 302V325" stroke="#a0f5da" stroke-width="3" stroke-linecap="round"/>
+    <text x="100" y="327" class="card-title">画室创作升级</text>
+    <rect x="521" y="302" width="78" height="27" rx="13.5" fill="#2d6b6066" stroke="#87dec068"/>
+    <text x="560" y="320.5" class="hash" text-anchor="middle" fill="#a6f4dd">12d7e6c</text>
+    <path d="M100 345H588" stroke="#91dec8" stroke-opacity=".20" stroke-width="1"/>
+
+    <rect x="101" y="359" width="25" height="21" rx="5" fill="#5bd6b728" stroke="#9aead46b"/>
+    <text x="113.5" y="374" class="hash" text-anchor="middle" fill="#abffea">W</text>
+    <text x="136" y="375" class="topic" fill="#adf3df">魔法棒</text>
+    <text x="101" y="397" class="body">一键抠底 · 容差可调 · 支持撤销</text>
+
+    <rect x="101" y="407" width="25" height="21" rx="5" fill="#5bd6b728" stroke="#9aead46b"/>
+    <text x="113.5" y="422" class="hash" text-anchor="middle" fill="#abffea">O</text>
+    <text x="136" y="423" class="topic" fill="#adf3df">活体追踪大眼</text>
+    <text x="101" y="445" class="body">3 款贴纸、最多 4 只 · 跟随鱼食和指针</text>
+
+    <text x="101" y="469" class="topic" fill="#adf3df">吐泡泡口头禅</text>
+    <text x="101" y="491" class="body">放生时填写 ≤12 字，入缸后随鱼吐泡泡</text>
+
+    <g id="crowned-fish" transform="translate(460 384)" aria-hidden="true">
+      <ellipse cx="55" cy="46" rx="74" ry="49" fill="url(#aurora)"/>
+      <path d="M29 66C52 86 66 79 63 61Z" fill="#3c9ca8" stroke="#82d7c8" stroke-opacity=".7"/>
+      <path d="M82 50Q106 32 124 28L116 47L125 67Q101 64 82 53Z"
+            fill="#4899c0" stroke="#a0eddf" stroke-opacity=".78" stroke-width="1.35"/>
+      <path d="M7 50C12 32 34 26 51 28C70 29 96 38 100 50C96 62 73 72 51 73C29 74 11 66 7 50Z"
+            fill="url(#fish-body)" stroke="#b5ffe8" stroke-opacity=".92" stroke-width="1.5"/>
+      <path d="M47 35Q56 25 70 25L74 41" fill="#63c5c6" stroke="#a7f3db" stroke-width="1.15" stroke-linejoin="round"/>
+      <path d="M39 30l-5-17 12 6 9-13 9 13 12-6-5 17Z" fill="url(#gold)" stroke="#ffedb5" stroke-width="1.05" stroke-linejoin="round"/>
+      <circle cx="30" cy="49" r="11.2" fill="#f0ffff" stroke="#194253" stroke-width="1.7"/>
+      <circle cx="27" cy="49" r="6" fill="#142d42"/>
+      <circle cx="25" cy="47" r="1.8" fill="#ffffff"/>
+      <path d="M17 60q6 5 11 1M60 58q12-7 19-2-8 9-17 8" fill="none" stroke="#24687d" stroke-opacity=".77" stroke-width="1.4" stroke-linecap="round"/>
+      <g fill="none" stroke="#befff2" stroke-opacity=".68">
+        <circle cx="112" cy="5" r="5.3"/><circle cx="132" cy="20" r="3.4"/>
+      </g>
+      <circle cx="101" cy="17" r="2" fill="#bcfff1" opacity=".70"/>
+    </g>
+  </g>
+
+  <!-- Public tank -->
+  <g id="card-tank">
+    <rect id="tank-panel" x="816" y="285" width="560" height="218" rx="22" fill="url(#glass-blue)" stroke="#8ec8f5" stroke-opacity=".52" stroke-width="1.25"/>
+    <path d="M838 302V325" stroke="#a6ddff" stroke-width="3" stroke-linecap="round"/>
+    <text x="852" y="327" class="card-title">公共鱼缸花活与分享</text>
+    <rect x="1273" y="302" width="78" height="27" rx="13.5" fill="#447fa955" stroke="#a5d8ff66"/>
+    <text x="1312" y="320.5" class="hash" text-anchor="middle" fill="#c4e8ff">12d7e6c</text>
+    <path d="M852 345H1340" stroke="#9cd6fa" stroke-opacity=".21" stroke-width="1"/>
+    <g fill="#a3d8ff" aria-hidden="true">
+      <circle cx="854" cy="370" r="3.1"/><circle cx="854" cy="397" r="3.1"/><circle cx="854" cy="424" r="3.1"/>
+      <circle cx="854" cy="451" r="3.1"/><circle cx="854" cy="478" r="3.1"/>
+    </g>
+    <text x="868" y="376" class="body"><tspan class="topic" fill="#ffe1a1">黄金大餐</tspan> · 每结算 15 颗普通鱼食触发，吃到 +3 XP</text>
+    <text x="868" y="403" class="body">双击敲缸 · 撞飞漫画震屏 <tspan fill="#ffdd9c">「💥 咣！」</tspan></text>
+    <text x="868" y="430" class="body">上海实时昼夜潮汐 · 深夜生物荧光</text>
+    <text x="868" y="457" class="body">趣味三榜 · SSE 实时走马灯</text>
+    <text x="868" y="484" class="body">一键保存 <tspan font-weight="670" fill="#c9ebff">720 × 960 六维海报 PNG</tspan></text>
+
+    <g id="golden-feast-art" transform="translate(1293 433)" aria-hidden="true">
+      <circle r="53" fill="url(#warm-glow)"/>
+      <circle r="33" fill="none" stroke="#ffe1a1" stroke-opacity=".35" stroke-dasharray="2 6"/>
+      <path d="M0-30L8-10 30 0 8 9 0 31-9 9-30 0-9-10Z" fill="url(#gold)" stroke="#fff1c8" stroke-width="1.2"/>
+      <path d="M25-26l2.7-8 2.7 8 8 2.8-8 2.8-2.7 8-2.7-8-8-2.8ZM-27 19l2 5.6 5.6 2-5.6 2-2 5.6-2-5.6-5.6-2 5.6-2Z"
+            fill="#fff0b1" opacity=".92"/>
+      <circle cx="40" cy="16" r="2.2" fill="#ffe2a1"/>
+      <circle cx="-26" cy="-22" r="2.4" fill="#ffd781"/>
+    </g>
+  </g>
+
+  <!-- Food jar -->
+  <g id="card-rations">
+    <rect id="ration-panel" x="64" y="566" width="560" height="219" rx="22" fill="url(#glass-teal)" stroke="#8edcbb" stroke-opacity=".57" stroke-width="1.25"/>
+    <path d="M86 583V606" stroke="#a3efd0" stroke-width="3" stroke-linecap="round"/>
+    <text x="100" y="608" class="card-title">20 颗在线体力鱼食罐</text>
+    <rect x="521" y="583" width="78" height="27" rx="13.5" fill="#2e6e605f" stroke="#92e3c566"/>
+    <text x="560" y="601.5" class="hash" text-anchor="middle" fill="#b2f5de">0b4bac5</text>
+    <path d="M100 626H588" stroke="#91dec8" stroke-opacity=".20" stroke-width="1"/>
+    <g fill="#8cf0d6" aria-hidden="true">
+      <circle cx="102" cy="646" r="3.1"/><circle cx="102" cy="673" r="3.1"/><circle cx="102" cy="700" r="3.1"/>
+      <circle cx="102" cy="727" r="3.1"/><circle cx="102" cy="754" r="3.1"/>
+    </g>
+    <text x="116" y="652" class="body">默认 <tspan class="topic" fill="#b9f6de">20 颗</tspan> · 上限 <tspan class="topic" fill="#b9f6de">20 颗</tspan></text>
+    <text x="116" y="679" class="body">复用 <tspan fill="#b0f6eb">/api/events</tspan> SSE，在线每 60 秒 +1</text>
+    <text x="116" y="706" class="body">多标签去重 · 每位养鱼人只计一份在线时间</text>
+    <text x="116" y="733" class="body">关页暂停并保留零头 · 跨午夜继续累计</text>
+    <text x="116" y="760" class="body">注册或找回身份后，自动重连 SSE</text>
+
+    <g id="ration-jar" transform="translate(490 638)" aria-hidden="true">
+      <ellipse cx="48" cy="65" rx="60" ry="60" fill="url(#aurora)"/>
+      <path d="M26 10h43v12l13 17v59a13 13 0 0 1-13 13H26a13 13 0 0 1-13-13V39l13-17Z"
+            fill="url(#bottle)" stroke="#a7eee1" stroke-opacity=".82" stroke-width="1.6"/>
+      <rect x="23" y="7" width="50" height="17" rx="4" fill="#3a6e78" stroke="#a6e7e1" stroke-width="1.4"/>
+      <path d="M31 12v7m8-7v7m8-7v7m8-7v7m8-7v7" stroke="#a6e7e1" stroke-opacity=".52"/>
+      <path d="M23 41h49M23 96h49M22 48v8" stroke="#baf7e9" stroke-opacity=".48" fill="none" stroke-linecap="round"/>
+      <g fill="url(#gold)" stroke="#ffe3a4" stroke-width=".45">
+        <circle cx="29" cy="53" r="3"/><circle cx="41" cy="53" r="3"/><circle cx="53" cy="53" r="3"/><circle cx="65" cy="53" r="3"/>
+        <circle cx="29" cy="62" r="3"/><circle cx="41" cy="62" r="3"/><circle cx="53" cy="62" r="3"/><circle cx="65" cy="62" r="3"/>
+        <circle cx="29" cy="71" r="3"/><circle cx="41" cy="71" r="3"/><circle cx="53" cy="71" r="3"/><circle cx="65" cy="71" r="3"/>
+        <circle cx="29" cy="80" r="3"/><circle cx="41" cy="80" r="3"/><circle cx="53" cy="80" r="3"/><circle cx="65" cy="80" r="3"/>
+        <circle cx="29" cy="89" r="3"/><circle cx="41" cy="89" r="3"/><circle cx="53" cy="89" r="3"/><circle cx="65" cy="89" r="3"/>
+      </g>
+      <path d="M93 29v14m-7-7h14" stroke="#c6fff2" stroke-opacity=".8" stroke-width="1.35" stroke-linecap="round"/>
+      <circle cx="92" cy="58" r="3.6" fill="none" stroke="#b6f7e8" stroke-opacity=".57"/>
+    </g>
+  </g>
+
+  <!-- Growth -->
+  <g id="card-growth">
+    <rect id="growth-panel" x="816" y="566" width="560" height="219" rx="22" fill="url(#glass-plum)" stroke="#b6a5ea" stroke-opacity=".54" stroke-width="1.25"/>
+    <path d="M838 583V606" stroke="#d0bcff" stroke-width="3" stroke-linecap="round"/>
+    <text x="852" y="608" class="card-title">鱼肚容量 · 六维 · Lv.18 鱼皇</text>
+    <rect x="1273" y="583" width="78" height="27" rx="13.5" fill="#795baf4b" stroke="#baabeb70"/>
+    <text x="1312" y="601.5" class="hash" text-anchor="middle" fill="#e1d3ff">7a6f8dd</text>
+    <path d="M852 626H1340" stroke="#c8b8f5" stroke-opacity=".23" stroke-width="1"/>
+    <g fill="#c6b5ff" aria-hidden="true">
+      <circle cx="854" cy="646" r="3.1"/><circle cx="854" cy="673" r="3.1"/><circle cx="854" cy="700" r="3.1"/>
+      <circle cx="854" cy="727" r="3.1"/><circle cx="854" cy="754" r="3.1"/>
+    </g>
+    <text x="868" y="652" class="body">实时惰性消化 <tspan class="topic" fill="#e0d1ff">120s → 9s</tspan>，取代每日 6 颗上限</text>
+    <text x="868" y="679" class="body">鱼肚满格后贪吃微撑 · 再吃 2 口翻肚皮休眠</text>
+    <text x="868" y="706" class="body">第 6 维 <tspan class="topic" fill="#e0d1ff">「胃口」</tspan> · 每点 +2 容量、消化加速 8%</text>
+    <text x="868" y="733" class="body">成长体型 <tspan class="topic" fill="#e0d1ff">40 → 275 px</tspan> · 饱腹时肚皮动态鼓起</text>
+    <text x="868" y="760" class="body"><tspan class="topic" fill="#ffe4a7">Lv.18 鱼皇</tspan> · 专属小金冠</text>
+  </g>
+
+  <!-- Product and state flows -->
+  <g id="flow-studio-tank">
+    <path d="M627 408H811" fill="none" stroke="#8cf0d6" stroke-opacity=".21" stroke-width="8" stroke-linecap="round"/>
+    <path d="M627 408H811" fill="none" stroke="#8cf0d6" stroke-width="2.35" stroke-linecap="round" marker-end="url(#arrow-mint)"/>
+    <rect x="667" y="369" width="106" height="27" rx="13.5" fill="#102f37" stroke="#8cf0d666"/>
+    <text x="720" y="387.5" class="flow-label" text-anchor="middle" fill="#b4ffe8">放生入缸</text>
+  </g>
+
+  <g id="flow-tank-rations">
+    <path d="M965 506V527Q965 536 956 536H353Q344 536 344 545V561"
+          fill="none" stroke="#a3d8ff" stroke-width="2" stroke-opacity=".86" stroke-linecap="round" marker-end="url(#arrow-blue)"/>
+    <rect x="546" y="521" width="165" height="29" rx="14.5" fill="#112d40" stroke="#a3d8ff77"/>
+    <text x="628.5" y="540.5" class="flow-label" text-anchor="middle" fill="#d1edff">观察饱腹，再投喂</text>
+  </g>
+
+  <g id="flow-rations-growth">
+    <path d="M627 684H811" fill="none" stroke="#8cf0d6" stroke-opacity=".21" stroke-width="8" stroke-linecap="round"/>
+    <path d="M627 684H811" fill="none" stroke="#8cf0d6" stroke-width="2.35" stroke-linecap="round" marker-end="url(#arrow-mint)"/>
+    <rect x="653" y="645" width="134" height="27" rx="13.5" fill="#102f37" stroke="#8cf0d666"/>
+    <text x="720" y="663.5" class="flow-label" text-anchor="middle" fill="#b4ffe8">投喂并结算进食</text>
+  </g>
+
+  <g id="flow-growth-tank">
+    <path d="M1173 562V508" fill="none" stroke="#c6b5ff" stroke-width="2.2"
+          stroke-opacity=".94" stroke-linecap="round" marker-end="url(#arrow-lavender)"/>
+    <rect x="1189" y="521" width="132" height="29" rx="14.5" fill="#232a46" stroke="#c6b5ff78"/>
+    <text x="1255" y="540.5" class="flow-label" text-anchor="middle" fill="#e4d8ff">成长状态回流</text>
+  </g>
+
+  <!-- Deployment and data foundation -->
+  <g id="production">
+    <rect id="production-panel" x="64" y="818" width="1312" height="125" rx="21" fill="url(#glass)" stroke="#79afca" stroke-opacity=".58" stroke-width="1.25"/>
+    <rect x="65" y="819" width="1310" height="41" rx="20" fill="#1c4160" fill-opacity=".31"/>
+    <path d="M84 834V850" stroke="#9ed7ff" stroke-width="3" stroke-linecap="round"/>
+    <text x="98" y="850" class="section">生产底座与上线保障</text>
+    <rect x="304" y="831" width="76" height="25" rx="12.5" fill="#1c4259" stroke="#8bb8dd55"/>
+    <text x="342" y="848" class="hash" text-anchor="middle" fill="#b5dcf7">d95f311</text>
+    <text x="394" y="849" class="platform-detail">运维迁移</text>
+    <path d="M88 865H1352M402 879V927M719 879V927M1036 879V927"
+          stroke="#9ac6d9" stroke-opacity=".25" stroke-width="1"/>
+    <g id="production-https">
+      <text x="94" y="890" class="platform-label" fill="#bce8ff">Caddy 2 自动 HTTPS</text>
+      <text x="94" y="916" class="platform-detail">fangjie.site · fish.fangjie.site</text>
+    </g>
+    <g id="production-sse">
+      <text x="422" y="890" class="platform-label" fill="#bce8ff">SSE 无缓冲直通</text>
+      <text x="422" y="916" class="platform-detail">flush_interval -1</text>
+    </g>
+    <g id="production-images">
+      <text x="739" y="890" class="platform-label" fill="#bce8ff">Apple Container 多架构镜像</text>
+      <text x="739" y="916" class="platform-detail">amd64 / arm64</text>
+    </g>
+    <g id="production-sqlite">
+      <text x="1056" y="890" class="platform-label" fill="#bce8ff">SQLite 自动增量迁移</text>
+      <text x="1056" y="916" class="platform-detail">兼容旧库 · 零停机上线目标</text>
+    </g>
+  </g>
+</svg>
