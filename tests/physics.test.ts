@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { EMPTY_STATS, type BellyOverload, type Stats } from '../shared/domain'
-import { createSwimmer, cruiseSpeed, floorY, knockTank, mouthPosition, stepTank, type CollisionEvent, type Food, type Swimmer } from '../src/tank/physics'
+import {
+  createSwimmer, cruiseSpeed, floorY, knockTank, mouthPosition, stepTank, stunDuration, STUN_IMMUNITY_SECONDS,
+  type CollisionEvent, type Food, type Swimmer,
+} from '../src/tank/physics'
 import { resolveTidePhase } from '../src/tank/ambient'
 
 const water = { width: 960, height: 600 }
@@ -10,6 +13,14 @@ const body = (id: string, stats: Partial<Stats> = {}, bellyOverload: BellyOverlo
 const pellet = (x: number, y: number): Food => ({ id: 'pellet', x, y, age: 0, claiming: false })
 const simulate = (fish: Swimmer[], food: Food[], seconds: number) => {
   for (let step = 0; step < Math.round(seconds * 60); step++) stepTank(fish, food, water, 1 / 60)
+}
+const ram = (victim: Swimmer) => {
+  const attacker = createSwimmer(body('attacker'), victim.x - 33, victim.y, 0, 0)
+  const food = pellet(victim.x + 120, victim.y)
+  attacker.targetId = food.id
+  const hits: CollisionEvent[] = []
+  stepTank([attacker, victim], [food], water, 0, { onCollision: hit => hits.push(hit) })
+  return hits
 }
 
 describe('公共鱼缸物理', () => {
@@ -134,8 +145,71 @@ describe('公共鱼缸物理', () => {
     const powerful = collision(6, true)
     expect(mild.pushX).toBeGreaterThan(0)
     expect(powerful.pushX).toBeGreaterThan(mild.pushX * 2)
-    expect(powerful.stun).toBeGreaterThan(mild.stun)
+    expect(mild.stun).toBe(stunDuration(0))
+    expect(powerful.stun).toBe(stunDuration(6))
     expect(powerful.sprinting).toBe(false)
+  })
+
+  it('冲撞力 0 到 6 对应 1.8 到 4.5 秒击晕', () => {
+    expect(stunDuration(0)).toBe(1.8)
+    expect(stunDuration(6)).toBe(4.5)
+  })
+
+  it('被撞的鱼先滑退再停住，晕眩期间不转身、不追食也不响应敲玻璃', () => {
+    const victim = createSwimmer(body('victim', { sense: 6 }), 450, 250, 0.3, 0)
+    victim.targetId = 'pellet'
+    victim.alertTimer = 0.5
+    victim.reaction = 0.1
+    const { x, heading, facing, speed } = victim
+    const hits = ram(victim)
+    const force = (42 + 40 * 0.24) / (1 + 40 / 180)
+
+    expect(hits).toHaveLength(1)
+    expect(hits[0].force).toBeCloseTo(force)
+    expect(victim).toMatchObject({ targetId: null, sprinting: false, alertTimer: 0, reaction: 0, speed: speed * 0.25 })
+    simulate([victim], [], 0.25)
+    expect(victim.x).toBeGreaterThan(x + 5)
+    simulate([victim], [], 0.85)
+    expect(victim).toMatchObject({ heading, facing, speed: 0, pushX: 0, pushY: 0 })
+    const stopped = { x: victim.x, y: victim.y, heading, facing }
+    const mouth = mouthPosition(victim, water)
+    const food = { ...pellet(mouth.x, mouth.y), age: 1 }
+    const alerts: string[] = []
+
+    expect(knockTank([victim], victim.x + 20, victim.y - 30, water)).toEqual([])
+    expect(stepTank([victim], [food], water, 0.1, { onAlert: id => alerts.push(id) })).toEqual([])
+    expect(alerts).toEqual([])
+    expect(victim.stun).toBeGreaterThan(0)
+    expect(victim).toMatchObject({
+      ...stopped, speed: 0, pushX: 0, pushY: 0, scaredTimer: 0, targetId: null, sprinting: false, reaction: 0,
+    })
+  })
+
+  it('醒来后恢复追食，直到 1.2 秒保护期结束才会再次被撞晕', () => {
+    const victim = createSwimmer(body('victim', { sense: 6 }), 450, 250, 0, 0)
+    expect(ram(victim)).toHaveLength(1)
+    expect(victim.stunImmunity).toBeCloseTo(stunDuration(0) + STUN_IMMUNITY_SECONDS)
+    const food = pellet(780, victim.y)
+
+    simulate([victim], [food], stunDuration(0) + 0.15)
+    expect(victim).toMatchObject({ stun: 0, targetId: food.id, sprinting: true })
+    expect(victim.stunImmunity).toBeCloseTo(STUN_IMMUNITY_SECONDS - 0.15)
+    expect(ram(victim)).toEqual([])
+
+    simulate([victim], [food], STUN_IMMUNITY_SECONDS - 0.2)
+    expect(victim.stunImmunity).toBeCloseTo(0.05)
+    expect(ram(victim)).toEqual([])
+    simulate([victim], [food], 0.1)
+    expect(victim.stunImmunity).toBe(0)
+    expect(ram(victim)).toHaveLength(1)
+    expect(victim.stun).toBe(stunDuration(0))
+  })
+
+  it('撑翻睡觉的鱼不会被冲撞或击晕', () => {
+    const sleeping = createSwimmer(body('sleeping', {}, 2), 450, 250, 0, 0)
+
+    expect(ram(sleeping)).toEqual([])
+    expect(sleeping).toMatchObject({ stun: 0, stunImmunity: 0, pushX: 0, pushY: 0 })
   })
 
   it('两条 275 像素大鱼相距 200 像素时可以发生追食冲撞', () => {

@@ -19,6 +19,7 @@ export interface MeshPose {
   tilt?: number
   scaleY?: number
   sprinting?: boolean
+  stunned?: boolean
   bellyFillRatio?: number
   bellyOverload?: BellyOverload
   isEmperor?: boolean
@@ -29,7 +30,7 @@ export interface MeshPose {
 
 export function drawFishEye(
   ctx: CanvasRenderingContext2D, x: number, y: number, radius: number, style: EyeStyle,
-  direction: Point = { x: -1, y: 0 }, sleepy = false,
+  direction: Point = { x: -1, y: 0 }, sleepy = false, stunned = false,
 ) {
   if (sleepy) {
     ctx.save()
@@ -46,19 +47,32 @@ export function drawFishEye(
     ctx.restore()
     return
   }
-  const distance = Math.hypot(direction.x, direction.y)
-  const offset = Math.min(0.29, distance / Math.max(radius * 4, 1)) * radius
-  const pupilX = distance ? direction.x / distance * offset : 0
-  const pupilY = distance ? direction.y / distance * offset : 0
   ctx.save()
   ctx.translate(x, y)
   ctx.beginPath()
   ctx.arc(0, 0, radius, 0, Math.PI * 2)
-  ctx.fillStyle = style === 'fierce' ? '#fff1d8' : '#f3fffe'
+  ctx.fillStyle = stunned ? '#fff4db' : style === 'fierce' ? '#fff1d8' : '#f3fffe'
   ctx.fill()
   ctx.strokeStyle = '#111c2d'
   ctx.lineWidth = Math.max(0.65, radius * 0.14)
   ctx.stroke()
+  if (stunned) {
+    const reach = radius * 0.43
+    ctx.beginPath()
+    ctx.moveTo(-reach, -reach)
+    ctx.lineTo(reach, reach)
+    ctx.moveTo(reach, -reach)
+    ctx.lineTo(-reach, reach)
+    ctx.lineCap = 'round'
+    ctx.lineWidth = Math.min(radius * 0.5, Math.max(0.6, radius * 0.26))
+    ctx.stroke()
+    ctx.restore()
+    return
+  }
+  const distance = Math.hypot(direction.x, direction.y)
+  const offset = Math.min(0.29, distance / Math.max(radius * 4, 1)) * radius
+  const pupilX = distance ? direction.x / distance * offset : 0
+  const pupilY = distance ? direction.y / distance * offset : 0
   ctx.clip()
   ctx.beginPath()
   const pupil = radius * (style === 'googly' ? 0.48 : 0.35)
@@ -130,6 +144,7 @@ export function drawFishMesh(
   const sleeping = overload === 2
   const bulge = height * (fill * 0.24 + (overload === 1 ? 0.14 : sleeping ? 0.22 : 0))
   const amplitude = Math.min(13, width * (pose.sprinting ? 0.087 : 0.06)) * waveFactor(fill, overload)
+    * (pose.stunned ? 0.14 : 1)
   const sourceStep = sourceWidth / SLICES
   const step = width / SLICES
   const tilt = pose.tilt ?? 0
@@ -159,7 +174,7 @@ export function drawFishMesh(
       const strip = Math.min(SLICES - 1, Math.floor(eye.x * SLICES))
       const y = (eye.y - 0.5) * height + offset(strip) + bulge * bellyWeights[strip] * (eye.y - 0.14)
       const direction = pose.lookTarget ? { x: targetX - x, y: targetY - y } : undefined
-      drawFishEye(ctx, x, y, eye.radius * pose.size, eye.style, direction, sleeping)
+      drawFishEye(ctx, x, y, eye.radius * pose.size, eye.style, direction, sleeping, Boolean(pose.stunned))
     }
   }
   ctx.restore()

@@ -17,6 +17,7 @@ export interface Swimmer {
   energy: number
   rest: number
   stun: number
+  stunImmunity: number
   alertTimer: number
   scaredTimer: number
   targetId: string | null
@@ -59,6 +60,8 @@ export interface Water {
 const baseCruiseSpeed = (size: number) => 49 - (size - 40) * 0.055
 export const cruiseSpeed = (body: Body) => baseCruiseSpeed(body.size) * getBellyMovementFactor(body.bellyFillRatio, body.bellyOverload)
 export const sightRadius = (sense: number) => 185 + sense * 48
+export const stunDuration = (brawn: number) => 1.8 + brawn * 0.45
+export const STUN_IMMUNITY_SECONDS = 1.2
 const SPLASH_SECONDS = 0.48
 const energyLimit = (stamina: number) => 2.3 + stamina * 0.49
 export const displayedSize = (size: number, water: Water) => Math.min(size, water.width * 0.35, water.height * 0.48)
@@ -71,7 +74,7 @@ const clamp = (value: number, low: number, high: number) => Math.min(high, Math.
 export function createSwimmer(body: Body, x: number, y: number, heading: number, phase: number): Swimmer {
   return {
     body, x, y, heading, phase, speed: cruiseSpeed(body), energy: energyLimit(body.stats.stamina),
-    rest: 0, stun: 0, alertTimer: 0, scaredTimer: 0, targetId: null, reaction: 0, facing: Math.cos(heading) > 0 ? -1 : 1,
+    rest: 0, stun: 0, stunImmunity: 0, alertTimer: 0, scaredTimer: 0, targetId: null, reaction: 0, facing: Math.cos(heading) > 0 ? -1 : 1,
     pushX: 0, pushY: 0, sprinting: false,
   }
 }
@@ -81,7 +84,7 @@ export function knockTank(fish: Swimmer[], x: number, y: number, water: Water): 
   const pointX = clamp(x, 0, water.width)
   const pointY = clamp(y, 0, water.height)
   for (const swimmer of fish) {
-    if (swimmer.body.bellyOverload === 2) continue
+    if (swimmer.body.bellyOverload === 2 || swimmer.stun > 0) continue
     const dx = swimmer.x - pointX
     const dy = swimmer.y - pointY
     const distance = Math.hypot(dx, dy)
@@ -132,6 +135,13 @@ function nearestFood(fish: Swimmer, pellets: Food[], water: Water) {
   return nearest && { pellet: nearest, inSight: distance <= sightRadius(fish.body.stats.sense) ** 2 }
 }
 
+function moveSwimmer(swimmer: Swimmer, water: Water, size: number, dt: number) {
+  swimmer.x = clamp(swimmer.x + (Math.cos(swimmer.heading) * swimmer.speed + swimmer.pushX) * dt,
+    size * 0.36, water.width - size * 0.36)
+  swimmer.y = clamp(swimmer.y + (Math.sin(swimmer.heading) * swimmer.speed + swimmer.pushY) * dt,
+    size * 0.22, water.height - size * 0.22)
+}
+
 export function stepTank(fish: Swimmer[], pellets: Food[], water: Water, dt: number, events?: TankStepEvents) {
   for (const pellet of pellets) {
     pellet.y = Math.min(floorY(water), pellet.y + (pellet.golden ? GOLDEN_SINK_SPEED : 37) * dt)
@@ -141,18 +151,39 @@ export function stepTank(fish: Swimmer[], pellets: Food[], water: Water, dt: num
   for (const swimmer of fish) {
     const { body } = swimmer
     const { stats } = body
-    const movement = getBellyMovementFactor(body.bellyFillRatio, body.bellyOverload)
     const size = displayedSize(body.size, water)
-    const weight = (body.size - 40) / 235
-    const margin = Math.min(size * 0.47 + 9, water.width * 0.22)
-    const ceiling = Math.min(64, water.height * 0.13) + size * 0.12
-    const bottom = Math.min(water.height - size * 0.28 - 8, floorY(water) + size * 0.14)
+    const energyRecovery = (0.46 + stats.stamina * 0.15) * dt
     swimmer.phase += dt
     swimmer.stun = Math.max(0, swimmer.stun - dt)
+    swimmer.stunImmunity = Math.max(0, swimmer.stunImmunity - dt)
     swimmer.rest = Math.max(0, swimmer.rest - dt)
     swimmer.alertTimer = Math.max(0, swimmer.alertTimer - dt)
     swimmer.scaredTimer = Math.max(0, swimmer.scaredTimer - dt)
 
+    if (swimmer.stun > 0) {
+      swimmer.targetId = null
+      swimmer.sprinting = false
+      swimmer.alertTimer = 0
+      swimmer.reaction = 0
+      swimmer.energy = Math.min(energyLimit(stats.stamina), swimmer.energy + energyRecovery)
+      swimmer.speed *= Math.exp(-10 * dt)
+      if (swimmer.speed < 0.5) swimmer.speed = 0
+      moveSwimmer(swimmer, water, size, dt)
+      const damping = Math.exp(-4.8 * dt)
+      swimmer.pushX *= damping
+      swimmer.pushY *= damping
+      if (Math.hypot(swimmer.pushX, swimmer.pushY) < 0.5) {
+        swimmer.pushX = 0
+        swimmer.pushY = 0
+      }
+      continue
+    }
+
+    const movement = getBellyMovementFactor(body.bellyFillRatio, body.bellyOverload)
+    const weight = (body.size - 40) / 235
+    const margin = Math.min(size * 0.47 + 9, water.width * 0.22)
+    const ceiling = Math.min(64, water.height * 0.13) + size * 0.12
+    const bottom = Math.min(water.height - size * 0.28 - 8, floorY(water) + size * 0.14)
     const food = body.bellyOverload !== 2 && !swimmer.scaredTimer ? nearestFood(swimmer, pellets, water) : undefined
     const target = food?.pellet
     const targetId = target?.id ?? null
@@ -166,17 +197,17 @@ export function stepTank(fish: Swimmer[], pellets: Food[], water: Water, dt: num
     }
     swimmer.reaction = Math.max(0, swimmer.reaction - dt)
     const pursuit = target && swimmer.reaction === 0
-    swimmer.sprinting = Boolean(pursuit && swimmer.energy > 0 && !swimmer.rest && !swimmer.stun)
+    swimmer.sprinting = Boolean(pursuit && swimmer.energy > 0 && !swimmer.rest)
     if (swimmer.sprinting) {
       swimmer.energy = Math.max(0, swimmer.energy - (1 + weight * 0.42) * dt)
       if (!swimmer.energy) swimmer.rest = 0.85
     } else {
-      swimmer.energy = Math.min(energyLimit(stats.stamina), swimmer.energy + (0.46 + stats.stamina * 0.15) * dt)
+      swimmer.energy = Math.min(energyLimit(stats.stamina), swimmer.energy + energyRecovery)
     }
 
     let heading = swimmer.heading + (Math.sin(swimmer.phase * 1.23) * 0.62 + Math.sin(swimmer.phase * 0.31) * 0.37) * dt
     const distance = target ? Math.hypot(target.x - swimmer.x, target.y - swimmer.y) : Infinity
-    if (target && !swimmer.stun) {
+    if (target) {
       heading = Math.atan2(target.y - swimmer.y, target.x - swimmer.x)
     } else {
       let vx = Math.cos(heading)
@@ -205,13 +236,10 @@ export function stepTank(fish: Swimmer[], pellets: Food[], water: Water, dt: num
     const cruising = baseCruiseSpeed(body.size)
     const speed = movement * (swimmer.sprinting
       ? (cruising + 62 + stats.burst * 22) * clamp(distance / (size * 0.56), 0.39, 1)
-      : cruising * (swimmer.scaredTimer ? 1 + swimmer.scaredTimer : swimmer.rest || swimmer.stun ? 0.66 : 1))
+      : cruising * (swimmer.scaredTimer ? 1 + swimmer.scaredTimer : swimmer.rest ? 0.66 : 1))
     const acceleration = (2.8 + stats.agility * 0.62) * movement
     swimmer.speed += (speed - swimmer.speed) * (1 - Math.exp(-acceleration * dt))
-    swimmer.x = clamp(swimmer.x + (Math.cos(swimmer.heading) * swimmer.speed + swimmer.pushX) * dt,
-      size * 0.36, water.width - size * 0.36)
-    swimmer.y = clamp(swimmer.y + (Math.sin(swimmer.heading) * swimmer.speed + swimmer.pushY) * dt,
-      size * 0.22, water.height - size * 0.22)
+    moveSwimmer(swimmer, water, size, dt)
     const direction = Math.cos(swimmer.heading)
     if (Math.abs(direction) > 0.12) {
       swimmer.facing += ((direction > 0 ? -1 : 1) - swimmer.facing) * (1 - Math.exp(-10 * dt))
@@ -223,18 +251,24 @@ export function stepTank(fish: Swimmer[], pellets: Food[], water: Water, dt: num
   for (const attacker of fish) {
     if (!attacker.sprinting || attacker.stun) continue
     for (const peer of fish) {
-      if (peer === attacker || peer.stun) continue
+      if (peer === attacker || peer.stun > 0 || peer.stunImmunity > 0 || peer.body.bellyOverload === 2) continue
       const dx = peer.x - attacker.x
       const dy = peer.y - attacker.y
       const gap = Math.hypot(dx, dy)
       const size = displayedSize(attacker.body.size, water) + displayedSize(peer.body.size, water)
       const ahead = dx * Math.cos(attacker.heading) + dy * Math.sin(attacker.heading)
       if (gap < 0.01 || gap > size * 0.49 || ahead <= 0) continue
-      const force = (19 + attacker.body.stats.brawn * 18 + attacker.body.size * 0.17) / (1 + peer.body.size / 160)
+      const force = (42 + attacker.body.stats.brawn * 28 + attacker.body.size * 0.24) / (1 + peer.body.size / 180)
       peer.pushX += dx / gap * force
       peer.pushY += dy / gap * force
-      peer.stun = 0.24 + attacker.body.stats.brawn * 0.058
+      const duration = stunDuration(attacker.body.stats.brawn)
+      peer.stun = duration
+      peer.stunImmunity = duration + STUN_IMMUNITY_SECONDS
+      peer.targetId = null
+      peer.alertTimer = 0
       peer.sprinting = false
+      peer.reaction = 0
+      peer.speed *= 0.25
       events?.onCollision?.({
         attackerId: attacker.body.id, victimId: peer.body.id,
         x: (attacker.x + peer.x) / 2, y: (attacker.y + peer.y) / 2,

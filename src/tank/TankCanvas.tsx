@@ -56,12 +56,16 @@ const floatText: Record<FeedOutcome, string> = {
 }
 const CROWDED_TANK_SIZE = 24
 
-function caption(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, fill: string, color: string) {
+function caption(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, fill: string, color: string, tankWidth?: number) {
   ctx.save()
   ctx.font = '11px system-ui, sans-serif'
   ctx.textAlign = 'center'
   ctx.textBaseline = 'middle'
   const width = ctx.measureText(text).width + 16
+  if (tankWidth !== undefined) {
+    const inset = Math.min(width / 2 + 4, tankWidth / 2)
+    x = Math.max(inset, Math.min(tankWidth - inset, x))
+  }
   ctx.fillStyle = fill
   ctx.beginPath()
   ctx.roundRect(x - width / 2, y - 10, width, 20, 9)
@@ -96,6 +100,7 @@ export function TankCanvas(props: Props) {
     let visible = false
     let crowded = false
     let lastBackdrop = -Infinity
+    let lastBonk = -Infinity
     let lastShake = -Infinity
     let tidePhase = resolveTidePhase(Date.now(), state.current.tideMode)
     let tideMinute = -1
@@ -208,10 +213,11 @@ export function TankCanvas(props: Props) {
         onCollision(hit) {
           if (hits.length >= 28) hits.shift()
           hits.push({ ...hit, start: time })
-          if (hit.brawn >= 3 && time - lastShake > 120) {
-            lastShake = time
+          if (time - lastBonk >= 180) {
+            lastBonk = time
             playSound('bonk')
           }
+          if (hit.brawn >= 2 && time - lastShake > 120) lastShake = time
           const target = pool.get(hit.attackerId)?.swimmer.targetId
           const local = target ? current.pellets.get(target) : undefined
           if (local && !local.busy && local.expiresAt > wallTime) current.onKnockout(hit)
@@ -275,6 +281,8 @@ export function TankCanvas(props: Props) {
         const size = displayedSize(fish.size, bounds)
         const { bellyFillRatio, bellyOverload } = body
         const sleeping = bellyOverload === 2
+        const stunned = swimmer.stun > 0
+        const spotlighted = current.spotlight === fish.id
         const y = swimmer.y + (sleeping ? Math.sin(seconds * 1.65 + phase * 0.16) * 5 : 0)
         const height = size * (image.naturalHeight || 1) / Math.max(image.naturalWidth || 1, image.naturalHeight || 1)
         const labelY = Math.max(11, y - height * (sleeping ? 0.9 : 0.5) - 11)
@@ -282,7 +290,7 @@ export function TankCanvas(props: Props) {
           const glowHeight = Math.max(12, height * 1.26)
           ctx.drawImage(nightGlow, x - size * 0.52, y - glowHeight / 2, size * 1.04, glowHeight)
         }
-        if (current.spotlight === fish.id) {
+        if (spotlighted) {
           const glow = ctx.createRadialGradient(x, y, 3, x, y, Math.max(34, size * 0.79))
           glow.addColorStop(0, '#88f9cb38')
           glow.addColorStop(1, '#88f9cb00')
@@ -313,7 +321,7 @@ export function TankCanvas(props: Props) {
           }
         }
         let lookTarget = pointer.current ?? { x: x + Math.cos(swimmer.heading) * 120, y: y + Math.sin(swimmer.heading) * 120 }
-        if (!sleeping && fish.eyes?.length) {
+        if (!sleeping && !stunned && fish.eyes?.length) {
           let nearest = Infinity
           for (const pellet of food.values()) {
             const gap = (x - pellet.x) ** 2 + (y - pellet.y) ** 2
@@ -322,11 +330,12 @@ export function TankCanvas(props: Props) {
         }
         const rocked = sleeping && knock && knockAge >= 0 && knockAge < 0.45 &&
           (x - knock.x) ** 2 + (y - knock.y) ** 2 <= KNOCK_RADIUS ** 2
-        const tilt = pitch(swimmer) + (rocked ? Math.sin(knockAge * 34) * (0.45 - knockAge) * 0.18 : 0)
-        visual.wavePhase += dt * fishWaveSpeed(swimmer.sprinting, bellyFillRatio, bellyOverload)
+        const dazedTilt = stunned ? -0.16 * Math.sign(swimmer.facing || 1) + Math.sin(seconds * 13 + phase) * 0.12 : 0
+        const tilt = pitch(swimmer) + dazedTilt + (rocked ? Math.sin(knockAge * 34) * (0.45 - knockAge) * 0.18 : 0)
+        if (!stunned) visual.wavePhase += dt * fishWaveSpeed(swimmer.sprinting, bellyFillRatio, bellyOverload)
         if (image.complete && image.naturalWidth) drawFishMesh(ctx, image, image.naturalWidth, image.naturalHeight, {
           x, y, size, time: phase, wavePhase: visual.wavePhase, facing: swimmer.facing, tilt,
-          sprinting: swimmer.sprinting, bellyFillRatio, bellyOverload, isEmperor: fish.stage === 'emperor',
+          sprinting: swimmer.sprinting, stunned, bellyFillRatio, bellyOverload, isEmperor: fish.stage === 'emperor',
           eyes: fish.eyes, lookTarget,
         })
         if (fish.keeperId === current.keeperId) {
@@ -335,7 +344,7 @@ export function TankCanvas(props: Props) {
           ctx.shadowColor = '#6ceac1'
           ctx.shadowBlur = 11
           ctx.beginPath()
-          ctx.arc(x, labelY - (sleeping ? 16 : 1), 3, 0, Math.PI * 2)
+          ctx.arc(x, stunned ? y - height / 2 : labelY - (sleeping ? 16 : 1), 3, 0, Math.PI * 2)
           ctx.fill()
           ctx.restore()
         }
@@ -349,24 +358,30 @@ export function TankCanvas(props: Props) {
             ctx.restore()
           }
         }
-        const burping = !sleeping && (bellyOverload === 1 || bellyFillRatio >= 0.75)
+        const burping = !sleeping && !stunned && (bellyOverload === 1 || bellyFillRatio >= 0.75)
           && (phase + visual.speechSeed % 13) % (bellyOverload === 1 ? 3.2 : 9.5) < 0.65
         if (burping) {
           caption(ctx, '嗝~', x, labelY - 4, '#102b3cb5', '#cdf1eb')
         }
-        if (current.spotlight === fish.id) caption(ctx, fish.name, x, y + height / 2 + 15, '#123947e8', '#c6ffec')
-        if (swimmer.alertTimer || swimmer.scaredTimer) {
+        if (spotlighted) caption(ctx, fish.name, x, y + height / 2 + 15, '#123947e8', '#c6ffec')
+        if (!stunned && (swimmer.alertTimer || swimmer.scaredTimer)) {
           const head = mouthPosition(swimmer, bounds)
           caption(ctx, '！', head.x, Math.min(labelY, head.y - 14), '#ffe17b', '#533c15')
         }
-        if (swimmer.stun > 0) {
+        if (stunned) {
+          const head = mouthPosition(swimmer, bounds)
+          const headOffset = (head.x - x) / 2
+          const starX = Math.max(21, Math.min(bounds.width - 21, x + headOffset))
+          const starY = Math.max(11, labelY + headOffset * Math.sin(tilt))
           ctx.fillStyle = '#ffeab0'
           for (let i = 0; i < 3; i++) {
             const angle = seconds * 8 + i * 2.1
-            sparkle(ctx, x + Math.cos(angle) * 14, labelY - 17 + Math.sin(angle) * 5, 4, angle)
+            sparkle(ctx, starX + Math.cos(angle) * 14, starY + Math.sin(angle) * 5, 4, angle)
           }
+          const badgeY = starY >= 33 ? starY - 21 : y + height / 2 + (spotlighted ? 39 : 15)
+          caption(ctx, `💫 晕了 · ${Math.ceil(swimmer.stun)}s`, x, badgeY, '#3a2238ea', '#ffe8a8', bounds.width)
         }
-        if (fish.tagline && !sleeping && !burping && !swimmer.targetId && !swimmer.stun && !swimmer.scaredTimer && speaking < 2) {
+        if (fish.tagline && !sleeping && !burping && !swimmer.targetId && !stunned && !swimmer.scaredTimer && speaking < 2) {
           const period = 14 + visual.speechSeed % 11
           const progress = (seconds + (visual.speechSeed % 997) / 997 * period) % period
           if (progress < 3.6) {
