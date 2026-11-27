@@ -29,13 +29,14 @@ const snapshot = (canvas: HTMLCanvasElement) => context(canvas).getImageData(0, 
 const imageTypes = ['image/png', 'image/jpeg', 'image/webp']
 
 interface StudioProps {
+  tankName: string
   onClose: () => void
   canRelease: boolean
   onNeedKeeper: () => void
   onRelease: (art: FishRelease) => Promise<void>
 }
 
-export function Studio({ onClose, canRelease, onNeedKeeper, onRelease }: StudioProps) {
+export function Studio({ tankName, onClose, canRelease, onNeedKeeper, onRelease }: StudioProps) {
   const art = useRef<HTMLCanvasElement>(null)
   const guidance = useRef<HTMLCanvasElement>(null)
   const eyeLayer = useRef<HTMLCanvasElement>(null)
@@ -480,6 +481,7 @@ export function Studio({ onClose, canRelease, onNeedKeeper, onRelease }: StudioP
     </div>
     {confirming && <Modal title="放生下水" onClose={() => { if (!busy) setConfirming(false) }}>
       <form className="release-form" noValidate onSubmit={event => { event.preventDefault(); void release() }}>
+        <span className="tank-badge">放生到：{tankName}</span>
         <label>鱼名
           <input ref={releaseName} value={name} required maxLength={32} disabled={busy} placeholder="输入 1～16 字"
             aria-invalid={!!error} aria-describedby={error ? 'release-name-error' : undefined}

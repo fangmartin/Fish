@@ -1,6 +1,11 @@
 export const MAX_RATIONS = 20
 export const RATION_REGEN_INTERVAL_MS = 60_000
+export const PUBLIC_TANK_ID = 'public'
 export const MAX_ACTIVE_FISH_PER_KEEPER = 3
+export const MAX_CUSTOM_TANKS_PER_KEEPER = 2
+export const MAX_OWNER_FISH_IN_CUSTOM_TANK = 10
+export const MAX_GUEST_FISH_IN_CUSTOM_TANK = 3
+export const MAX_TOTAL_FISH_IN_CUSTOM_TANK = 20
 export const TANK_VIEW_LIMIT = 35
 export const REPORT_HIDE_THRESHOLD = 3
 export const LEVEL_XP_COSTS = [1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3] as const
@@ -14,6 +19,40 @@ export const PELLET_LIFETIME_MS = 90_000
 export const GOLDEN_FEAST_EVERY_FEEDS = 15
 export const GOLDEN_FEAST_BONUS_XP = 3
 export const GOLDEN_FEAST_LIFETIME_MS = 120_000
+
+export function getKeeperTankFishLimit(tankId: string, isTankOwner: boolean) {
+  if (tankId === PUBLIC_TANK_ID) return MAX_ACTIVE_FISH_PER_KEEPER
+  return isTankOwner ? MAX_OWNER_FISH_IN_CUSTOM_TANK : MAX_GUEST_FISH_IN_CUSTOM_TANK
+}
+
+export function canPlaceFishInTank(input: {
+  tankId: string
+  isTankOwner: boolean
+  keeperFishInTank: number
+  totalFishInTank: number
+}) {
+  const keeperLimit = getKeeperTankFishLimit(input.tankId, input.isTankOwner)
+  if (input.keeperFishInTank >= keeperLimit) {
+    return { ok: false as const, reason: 'keeper_limit' as const, limit: keeperLimit }
+  }
+  if (input.tankId !== PUBLIC_TANK_ID && input.totalFishInTank >= MAX_TOTAL_FISH_IN_CUSTOM_TANK) {
+    return { ok: false as const, reason: 'tank_full' as const, limit: MAX_TOTAL_FISH_IN_CUSTOM_TANK }
+  }
+  return { ok: true as const }
+}
+
+export function normalizeInviteCode(input: unknown): string | null {
+  if (typeof input !== 'string') return null
+  const codePattern = /^[A-Z2-9]{8}$/i
+  const value = input.trim()
+  if (codePattern.test(value)) return value.toUpperCase()
+  try {
+    const code = (new URL(value).searchParams.get('tank') ?? '').trim()
+    return codePattern.test(code) ? code.toUpperCase() : null
+  } catch {
+    return null
+  }
+}
 
 export const EYE_STYLES = ['googly', 'deadpan', 'fierce'] as const
 export const MAX_FISH_EYES = 4

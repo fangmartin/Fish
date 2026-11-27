@@ -5,6 +5,8 @@ export interface Fish {
   keeperId: string
   nickname: string
   name: string
+  tankId: string
+  tankName: string
   tagline: string
   eyes: FishEye[]
   assetUrl: string
@@ -51,6 +53,8 @@ export interface FishRelease {
   pngBase64: string
   eyes: FishEye[]
   tagline: string
+  tankId?: string
+  inviteCode?: string
 }
 
 export interface Keeper {
@@ -100,8 +104,24 @@ export interface GoldenFeastClaim {
 }
 
 export interface TankView {
+  tank: TankSummary
   fish: Fish[]
   goldenFeast: GoldenFeast | null
+}
+
+export interface TankSummary {
+  id: string
+  name: string
+  isPublic: boolean
+  ownerId?: string
+  ownerNickname?: string
+  inviteCode?: string
+  isOwner: boolean
+  fishCount: number
+  maxFish: number | null
+  myFishCount: number
+  myFishLimit: number
+  createdAt?: number
 }
 
 export interface Leaderboard {
@@ -120,12 +140,15 @@ export interface TankTicker {
 
 export interface TankEvents {
   fish_released: { fish: Fish }
+  fish_left: { fishId: string }
   fish_archived: { fishId: string }
   fish_hidden: { fishId: string }
   fish_updated: { fish: Fish }
   pellet_consumed: { pelletId: string; fish: Fish; outcome: FeedOutcome; levelDelta: number }
   golden_feast_spawned: { goldenFeast: GoldenFeast }
   golden_feast_consumed: GoldenFeastClaim
+  tank_updated: { tank: TankSummary }
+  tank_deleted: { tankId: string }
   tank_ticker: TankTicker
   rations_updated: RationState
 }

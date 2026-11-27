@@ -3,9 +3,11 @@ import {
   EMPTY_STATS, LEVEL_XP_COSTS, MAX_ACTIVE_FISH_PER_KEEPER, MAX_EXPERIENCE, MAX_RATIONS,
   MAX_LEVEL, MAX_STAT_VALUE, RATION_REGEN_INTERVAL_MS, REPORT_HIDE_THRESHOLD, STAT_KEYS, TANK_VIEW_LIMIT,
   EYE_STYLES, GOLDEN_FEAST_BONUS_XP, GOLDEN_FEAST_EVERY_FEEDS, GOLDEN_FEAST_LIFETIME_MS, MAX_FISH_EYES,
-  allocateStats, applyGoldenFeast, canRespec, consumeRation, dailyCount, feedFish, formatDuration,
+  MAX_CUSTOM_TANKS_PER_KEEPER, MAX_GUEST_FISH_IN_CUSTOM_TANK, MAX_OWNER_FISH_IN_CUSTOM_TANK,
+  MAX_TOTAL_FISH_IN_CUSTOM_TANK, PUBLIC_TANK_ID,
+  allocateStats, applyGoldenFeast, canPlaceFishInTank, canRespec, consumeRation, dailyCount, feedFish, formatDuration,
   getBellyCapacity, getBellyMovementFactor, getBellyState, getBuildTitle, getDigestIntervalMs,
-  getGoldenFeastBellyCost, getGrowth, getStuffedComaMs, settleOnlineRations,
+  getGoldenFeastBellyCost, getGrowth, getKeeperTankFishLimit, getStuffedComaMs, normalizeInviteCode, settleOnlineRations,
   shanghaiDate, unspentPoints, validateEyes, type FeedingState, type StatKey,
 } from '../shared/domain'
 
@@ -54,6 +56,37 @@ describe('共享领域规则', () => {
     expect([MAX_RATIONS, MAX_ACTIVE_FISH_PER_KEEPER, TANK_VIEW_LIMIT, REPORT_HIDE_THRESHOLD])
       .toEqual([20, 3, 35, 3])
     expect(RATION_REGEN_INTERVAL_MS).toBe(60_000)
+  })
+
+  it('分别限制公共缸、自建缸主和访客的在缸鱼数量', () => {
+    expect(PUBLIC_TANK_ID).toBe('public')
+    expect([
+      MAX_CUSTOM_TANKS_PER_KEEPER, MAX_OWNER_FISH_IN_CUSTOM_TANK,
+      MAX_GUEST_FISH_IN_CUSTOM_TANK, MAX_TOTAL_FISH_IN_CUSTOM_TANK,
+    ]).toEqual([2, 10, 3, 20])
+    expect(getKeeperTankFishLimit(PUBLIC_TANK_ID, true)).toBe(3)
+    expect(getKeeperTankFishLimit('living-room', true)).toBe(10)
+    expect(getKeeperTankFishLimit('living-room', false)).toBe(3)
+    const check = (tankId: string, isTankOwner: boolean, keeperFishInTank: number, totalFishInTank: number) =>
+      canPlaceFishInTank({ tankId, isTankOwner, keeperFishInTank, totalFishInTank })
+    expect(check(PUBLIC_TANK_ID, false, 2, 100)).toEqual({ ok: true })
+    expect(check(PUBLIC_TANK_ID, false, 3, 100)).toEqual({ ok: false, reason: 'keeper_limit', limit: 3 })
+    expect(check('living-room', true, 9, 19)).toEqual({ ok: true })
+    expect(check('living-room', true, 10, 19)).toEqual({ ok: false, reason: 'keeper_limit', limit: 10 })
+    expect(check('living-room', false, 3, 19)).toEqual({ ok: false, reason: 'keeper_limit', limit: 3 })
+    expect(check('living-room', false, 2, 20)).toEqual({ ok: false, reason: 'tank_full', limit: 20 })
+  })
+
+  it('接受邀请码和完整链接，并拒绝无效邀请码', () => {
+    expect(normalizeInviteCode('K7M9P2Q4')).toBe('K7M9P2Q4')
+    expect(normalizeInviteCode('  k7m9p2q4  ')).toBe('K7M9P2Q4')
+    expect(normalizeInviteCode('https://fish.test/?fish=demo&tank=k7m9p2q4')).toBe('K7M9P2Q4')
+    for (const value of [
+      null, 12345678, {}, '', 'short', 'K7M9P2Q0', 'K7M9P2Qß', 'https://fish.test/?tank=K7M9P2Q1',
+      'https://fish.test/?fish=demo', 'https://fish.test/?tank=',
+    ]) {
+      expect(normalizeInviteCode(value)).toBeNull()
+    }
   })
 
   it('在线累计每分钟补一颗，满罐清空进度，负值和小数按规则截断', () => {

@@ -2,6 +2,7 @@ import { useEffect, useRef, type MouseEvent } from 'react'
 import type { Fish, GoldenFeast } from '../../shared/contracts'
 import { formatDuration, getBellyState, type FeedOutcome } from '../../shared/domain'
 import { playSound, unlockSound } from '../audio/sound'
+import { getTankImage } from '../bootLoader'
 import { paintWater, resolveTidePhase, type TideMode } from './ambient'
 import { burst, createNightGlow, glassRipple, sparkle } from './effects'
 import { drawFishMesh, fishWaveSpeed } from './meshRenderer'
@@ -27,6 +28,7 @@ export interface TankEffect {
 }
 
 interface Props {
+  tankName: string
   fish: Fish[]
   keeperId?: string
   feeding: boolean
@@ -152,8 +154,7 @@ export function TankCanvas(props: Props) {
       for (const fish of current.fish) {
         let visual = pool.get(fish.id)
         if (!visual) {
-          const image = new Image()
-          image.src = fish.assetUrl
+          const image = getTankImage(fish.assetUrl)
           const index = pool.size
           const { id, size, stats, bellyFillRatio, bellyOverload } = fish
           const swimmer = createSwimmer({ id, size, stats, bellyFillRatio, bellyOverload },
@@ -165,6 +166,7 @@ export function TankCanvas(props: Props) {
             wavePhase: swimmer.phase, digestionRemainingSec: fish.digestionRemainingSec }
           pool.set(fish.id, visual)
         } else if (visual.fish !== fish) {
+          if (visual.fish.assetUrl !== fish.assetUrl) visual.image = getTankImage(fish.assetUrl)
           visual.fish = fish
           visual.clockOffset = fish.serverNow - wallTime
         }
@@ -450,7 +452,7 @@ export function TankCanvas(props: Props) {
     playSound('knock')
   }
 
-  return <canvas ref={ref} className={`tank-canvas${props.feeding ? ' feeding' : ''}`} aria-label="公共鱼缸水域"
+  return <canvas ref={ref} className={`tank-canvas${props.feeding ? ' feeding' : ''}`} aria-label={`${props.tankName}水域`}
     onClick={click} onDoubleClick={knock} onPointerMove={event => { pointer.current = coordinates(event) }}
     onPointerLeave={() => { pointer.current = null }} />
 }

@@ -2,12 +2,13 @@ import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type { Fish } from '../shared/contracts'
-import { MAX_RATIONS, dailyCount, getBellyState, getDigestIntervalMs, getGrowth, unspentPoints, type FishEye } from '../shared/domain'
+import { MAX_RATIONS, PUBLIC_TANK_ID, dailyCount, getBellyState, getDigestIntervalMs, getGrowth, unspentPoints, type FishEye } from '../shared/domain'
 
 export type KeeperRow = { id: string; nickname: string; passcode: string }
 export type AfterCommit = (effect: () => void) => void
 export type FishRow = {
   id: string; keeper_id: string; nickname: string; name: string
+  tank_id: string; tank_name: string | null; invite_code: string | null
   is_system: number; is_hidden: number; status: Fish['status']; created_at: number
   experience: number; burst: number; stamina: number; sense: number; agility: number; brawn: number; appetite: number
   last_respec_date: string | null
@@ -26,6 +27,7 @@ const fishColumnDefinitions = {
   belly_load: 'INTEGER NOT NULL DEFAULT 0',
   belly_full: 'INTEGER NOT NULL DEFAULT 0',
   belly_updated_at: 'INTEGER NOT NULL DEFAULT 0',
+  tank_id: `TEXT NOT NULL DEFAULT '${PUBLIC_TANK_ID}'`,
 }
 
 export function openStorage(dataDir: string, dbPath: string) {
@@ -40,6 +42,18 @@ export function openStorage(dataDir: string, dbPath: string) {
       id TEXT PRIMARY KEY, nickname TEXT NOT NULL, passcode TEXT UNIQUE, session TEXT UNIQUE,
       rations INTEGER NOT NULL DEFAULT ${MAX_RATIONS}, ration_progress_ms INTEGER NOT NULL DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS tanks (
+      id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES keepers(id),
+      name TEXT NOT NULL, invite_code TEXT UNIQUE NOT NULL,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS tanks_owner ON tanks(owner_id, created_at);
+    CREATE TABLE IF NOT EXISTS tank_members (
+      tank_id TEXT NOT NULL REFERENCES tanks(id) ON DELETE CASCADE,
+      keeper_id TEXT NOT NULL REFERENCES keepers(id), joined_at INTEGER NOT NULL,
+      PRIMARY KEY (tank_id, keeper_id)
+    );
+    CREATE INDEX IF NOT EXISTS tank_members_keeper ON tank_members(keeper_id, joined_at);
     CREATE TABLE IF NOT EXISTS fish (
       id TEXT PRIMARY KEY, keeper_id TEXT NOT NULL REFERENCES keepers(id), name TEXT NOT NULL,
       is_system INTEGER NOT NULL DEFAULT 0, is_hidden INTEGER NOT NULL DEFAULT 0,
@@ -66,7 +80,6 @@ export function openStorage(dataDir: string, dbPath: string) {
       status TEXT NOT NULL CHECK (status IN ('active', 'consumed', 'expired')),
       winner_fish_id TEXT REFERENCES fish(id), consumed_at INTEGER
     );
-    CREATE UNIQUE INDEX IF NOT EXISTS golden_feast_active ON golden_feasts(status) WHERE status = 'active';
     CREATE INDEX IF NOT EXISTS golden_feast_winner ON golden_feasts(winner_fish_id, consumed_at);
     CREATE TABLE IF NOT EXISTS tank_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS reports (
@@ -103,12 +116,17 @@ export function openStorage(dataDir: string, dbPath: string) {
     if (!keeperColumns.has('ration_progress_ms')) {
       db.exec('ALTER TABLE keepers ADD COLUMN ration_progress_ms INTEGER NOT NULL DEFAULT 0')
     }
-    const columns = db.prepare('PRAGMA table_info(pellets)').all()
-    if (!columns.some(column => column.name === 'dropped_date')) {
+    const pelletColumns = new Set(db.prepare('PRAGMA table_info(pellets)').all().map(column => column.name))
+    if (!pelletColumns.has('dropped_date')) {
       db.exec('ALTER TABLE pellets ADD COLUMN dropped_date TEXT')
     }
-    db.exec(`CREATE INDEX IF NOT EXISTS pellet_drop_date
-      ON pellets(keeper_id, COALESCE(dropped_date, consumed_date))`)
+    if (!pelletColumns.has('tank_id')) {
+      db.exec(`ALTER TABLE pellets ADD COLUMN tank_id TEXT NOT NULL DEFAULT '${PUBLIC_TANK_ID}'`)
+    }
+    const feastColumns = new Set(db.prepare('PRAGMA table_info(golden_feasts)').all().map(column => column.name))
+    if (!feastColumns.has('tank_id')) {
+      db.exec(`ALTER TABLE golden_feasts ADD COLUMN tank_id TEXT NOT NULL DEFAULT '${PUBLIC_TANK_ID}'`)
+    }
     const fishColumns = new Set(db.prepare('PRAGMA table_info(fish)').all().map(column => column.name))
     for (const [name, definition] of Object.entries(fishColumnDefinitions)) {
       if (!fishColumns.has(name)) db.exec(`ALTER TABLE fish ADD COLUMN ${name} ${definition}`)
@@ -126,11 +144,19 @@ export function openStorage(dataDir: string, dbPath: string) {
         ) WHERE daily_eats_date IS NOT NULL;
       `)
     }
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS fish_tank_scope ON fish(tank_id, status, is_hidden, updated_at);
+      CREATE INDEX IF NOT EXISTS pellet_drop_date ON pellets(keeper_id, COALESCE(dropped_date, consumed_date));
+      DROP INDEX IF EXISTS golden_feast_active;
+      CREATE UNIQUE INDEX IF NOT EXISTS golden_feast_active_per_tank
+        ON golden_feasts(tank_id, status) WHERE status = 'active';
+    `)
     db.prepare(`INSERT OR IGNORE INTO tank_state(key, value)
-      SELECT 'normal_feeds_total', COUNT(*) FROM pellets WHERE status = 'consumed'`).run()
+      SELECT 'normal_feeds_total', COUNT(*) FROM pellets WHERE tank_id = ? AND status = 'consumed'`).run(PUBLIC_TANK_ID)
   })
 
-  const fishSelect = 'SELECT f.*, k.nickname FROM fish f JOIN keepers k ON k.id = f.keeper_id'
+  const fishSelect = `SELECT f.*, k.nickname, t.name AS tank_name, t.invite_code
+    FROM fish f JOIN keepers k ON k.id = f.keeper_id LEFT JOIN tanks t ON t.id = f.tank_id`
   const findFish = (id: string) => db.prepare(`${fishSelect} WHERE f.id = ?`).get(id) as FishRow | undefined
   const assetPath = (id: string) => join(assets, `${id}.png`)
 
@@ -147,9 +173,11 @@ export function presentFish(row: FishRow, nowMs: number): Fish {
     getBellyState(row.belly_load, rawStuffedFull, row.belly_updated_at, growth.level, stats.appetite, nowMs)
   return {
     id: row.id, keeperId: row.keeper_id, nickname: row.nickname, name: row.name, status: row.status,
+    tankId: row.tank_id, tankName: row.tank_name ?? '公共鱼缸',
     tagline: row.tagline, eyes: JSON.parse(row.eyes_json) as FishEye[],
     isHidden: !!row.is_hidden, isSystem: !!row.is_system, createdAt: row.created_at, experience: row.experience,
-    assetUrl: `/api/assets/fish/${row.id}.png`, ...growth, stats,
+    assetUrl: `/api/assets/fish/${row.id}.png` + (row.invite_code ? `?invite=${encodeURIComponent(row.invite_code)}` : ''),
+    ...growth, stats,
     unspentPoints: unspentPoints(growth.level, stats), lastRespecDate: row.last_respec_date,
     dailyEatsCount: dailyCount(row.daily_eats_count, row.daily_eats_date, nowMs), totalKnockouts: row.total_knockouts,
     rawBellyLoad: row.belly_load, rawStuffedFull, bellyUpdatedAt: row.belly_updated_at, serverNow: nowMs,

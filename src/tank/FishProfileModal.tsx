@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react'
-import type { Fish, FishProfile } from '../../shared/contracts'
+import type { Fish, FishProfile, TankSummary } from '../../shared/contracts'
 import {
-  EMPTY_STATS, MAX_STAT_VALUE, STAT_KEYS, canRespec, formatDuration, getBellyState, getBuildTitle,
+  EMPTY_STATS, MAX_STAT_VALUE, PUBLIC_TANK_ID, STAT_KEYS, canRespec, formatDuration, getBellyState, getBuildTitle,
   getDigestIntervalMs, type FeedOutcome, type Stats,
 } from '../../shared/domain'
-import { api, copyText } from '../api'
+import { api, copyText, tankLink } from '../api'
 import { Icon } from '../icons'
 import { Modal } from '../Modal'
 import { FishPreview } from './FishPreview'
@@ -16,13 +16,23 @@ const clock = new Intl.DateTimeFormat('zh-CN', {
   timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
 })
 
-export function FishProfileModal({ id, live, keeperId, onClose, onChange, onReport }: {
+function fishInvite(fish?: Fish, tank?: TankSummary) {
+  if (fish?.tankId === PUBLIC_TANK_ID) return undefined
+  if (tank && (!fish || tank.id === fish.tankId)) return tank.inviteCode
+  return fish ? new URL(fish.assetUrl, window.location.origin).searchParams.get('invite') ?? undefined : undefined
+}
+
+export function FishProfileModal({ id, live, keeperId, tank, keeperTanks, onClose, onChange, onReport, onMove, onEject }: {
   id: string
   live?: Fish
   keeperId?: string
+  tank?: TankSummary
+  keeperTanks: TankSummary[]
   onClose: () => void
   onChange: (fish: Fish) => void
   onReport: (hidden: boolean) => void
+  onMove: (fish: Fish) => void
+  onEject: () => void
 }) {
   const [profile, setProfile] = useState<FishProfile>()
   const [loadError, setLoadError] = useState('')
@@ -31,9 +41,10 @@ export function FishProfileModal({ id, live, keeperId, onClose, onChange, onRepo
   const [increments, setIncrements] = useState<Stats>({ ...EMPTY_STATS })
   const [busy, setBusy] = useState(false)
   const [savingPoster, setSavingPoster] = useState(false)
-  const [archiveConfirm, setArchiveConfirm] = useState(false)
+  const [confirming, setConfirming] = useState<'archive' | 'eject' | null>(null)
   const [wallTime, setWallTime] = useState(Date.now)
   const [receivedAt, setReceivedAt] = useState(Date.now)
+  const inviteCode = fishInvite(live, tank)
 
   useEffect(() => {
     const timer = window.setInterval(() => setWallTime(Date.now()), 1000)
@@ -42,15 +53,16 @@ export function FishProfileModal({ id, live, keeperId, onClose, onChange, onRepo
 
   useEffect(() => {
     const controller = new AbortController()
-    void api.fish(id, controller.signal).then(({ fish }) => {
+    void api.fish(id, inviteCode, controller.signal).then(({ fish }) => {
+      if (controller.signal.aborted) return
       setReceivedAt(Date.now())
       setLoadError('')
       setProfile(fish)
     }).catch(error => { if (!controller.signal.aborted) setLoadError(error.message) })
     return () => controller.abort()
-  }, [id, live])
+  }, [id, inviteCode, live])
 
-  async function edit(change: () => Promise<{ fish: Fish }>) {
+  async function edit(change: () => Promise<{ fish: Fish }>, after?: (fish: Fish) => void) {
     if (busy) return
     setBusy(true)
     setError('')
@@ -60,8 +72,9 @@ export function FishProfileModal({ id, live, keeperId, onClose, onChange, onRepo
       setReceivedAt(Date.now())
       setProfile(previous => ({ ...fish, feedingHistory: previous?.feedingHistory ?? [], totalEats: previous?.totalEats ?? 0 }))
       setIncrements({ ...EMPTY_STATS })
-      setArchiveConfirm(false)
+      setConfirming(null)
       onChange(fish)
+      after?.(fish)
     } catch (error) {
       setError(error instanceof Error ? error.message : '操作失败，请重试')
     } finally {
@@ -75,6 +88,9 @@ export function FishProfileModal({ id, live, keeperId, onClose, onChange, onRepo
 
   const fish = live && live.serverNow > profile.serverNow ? live : profile
   const owner = keeperId === fish.keeperId
+  const canMove = owner && fish.status === 'active' && !fish.isHidden
+  const canEject = !!tank?.isOwner && tank.id === fish.tankId && !owner && fish.status === 'active'
+  const destinations = canMove ? keeperTanks.filter(item => item.id !== fish.tankId) : []
   const now = Math.max(fish.serverNow, profile.serverNow + wallTime - receivedAt)
   const appetite = fish.stats.appetite + increments.appetite
   const intervalMs = getDigestIntervalMs(fish.level, appetite)
@@ -92,9 +108,11 @@ export function FishProfileModal({ id, live, keeperId, onClose, onChange, onRepo
   const interval = formatDuration(intervalMs / 1000)
   const digestionRemaining = formatDuration(digestionRemainingSec)
   const available = fish.unspentPoints - STAT_KEYS.reduce((sum, key) => sum + increments[key], 0)
-  const share = new URL(window.location.pathname, window.location.origin)
-  share.searchParams.set('fish', fish.id)
-  const posterFish = { ...profile, ...fish }
+  const shareInvite = fishInvite(fish, tank)
+  const share = tankLink(shareInvite, fish.id)
+  const asset = new URL(fish.assetUrl, window.location.origin)
+  if (shareInvite) asset.searchParams.set('invite', shareInvite)
+  const posterFish = { ...profile, ...fish, assetUrl: asset.href }
 
   async function savePoster() {
     setSavingPoster(true)
@@ -126,11 +144,12 @@ export function FishProfileModal({ id, live, keeperId, onClose, onChange, onRepo
   }
 
   return <Modal title={fish.name} onClose={onClose}>
-    <FishPreview fish={fish} bellyFillRatio={bellyFillRatio} bellyOverload={bellyOverload} />
+    <FishPreview fish={posterFish} bellyFillRatio={bellyFillRatio} bellyOverload={bellyOverload} />
     <div className="profile-meta">
       <span>{fish.nickname} · {stageNames[fish.stage]}</span>
       <span className="build-badge">{getBuildTitle(fish.stats, fish.level)}</span><strong>Lv.{fish.level}</strong>
     </div>
+    <span className="tank-badge">所在鱼缸：{tank?.id === fish.tankId ? tank.name : fish.tankName}</span>
     {fish.tagline && <p className="profile-tagline">「{fish.tagline}」</p>}
     <div className="progress-header"><span>成长经验</span><strong>{fish.nextLevelXp ? `${fish.progress} / ${fish.nextLevelXp}` : '已满级'}</strong></div>
     <progress className="growth-progress" value={fish.nextLevelXp ? fish.progress : 1} max={fish.nextLevelXp || 1} aria-label="成长经验" />
@@ -176,6 +195,13 @@ export function FishProfileModal({ id, live, keeperId, onClose, onChange, onRepo
         <span>{outcomeNames[record.outcome]}</span>
       </li>)}</ul>
     </details>}
+    {!!destinations.length && <section className="fish-move" aria-label="搬家换缸">
+      <h3>搬家换缸</h3>
+      <div className="profile-actions">
+        {destinations.map(target => <button key={target.id} className="button subtle" disabled={busy}
+          onClick={() => void edit(() => api.moveFish(fish.id, target.id), onMove)}>{target.name}</button>)}
+      </div>
+    </section>}
     {error && <p className="form-error" role="alert">{error}</p>}
     {feedback && <p className="feedback" role="status">{feedback}</p>}
     <footer className="profile-actions">
@@ -185,14 +211,19 @@ export function FishProfileModal({ id, live, keeperId, onClose, onChange, onRepo
         .catch(() => setFeedback(share.href))}><Icon name="copy" /> 复制链接</button>
       {fish.status === 'active' && !fish.isHidden && <button className="button subtle" disabled={busy} onClick={() => void report()}>
         <Icon name="flag" /> 举报</button>}
-      {owner && fish.status === 'active' && <button className="button subtle" disabled={busy} onClick={() => setArchiveConfirm(true)}>
+      {owner && fish.status === 'active' && <button className="button subtle" disabled={busy} onClick={() => setConfirming('archive')}>
         <Icon name="archive" /> 深海归档</button>}
+      {canEject && <button className="button subtle" disabled={busy} onClick={() => setConfirming('eject')}>请出本缸</button>}
     </footer>
-    {archiveConfirm && <div className="archive-confirm" role="group" aria-label="确认深海归档">
-      <p>归档后，这条鱼将离开公共鱼缸并永久收入你的图鉴。</p>
+    {confirming && <div className="archive-confirm" role="group" aria-label={confirming === 'archive' ? '确认深海归档' : '确认请出本缸'}>
+      <p>{confirming === 'archive' ? '归档后，这条鱼将离开当前鱼缸并永久收入你的图鉴。'
+        : '这条鱼会移出当前鱼缸，并收入其养鱼人的深海归档图鉴。'}</p>
       <div className="modal-actions">
-        <button className="button subtle" disabled={busy} onClick={() => setArchiveConfirm(false)}>取消</button>
-        <button className="button primary" disabled={busy} onClick={() => void edit(() => api.archive(fish.id))}>确认归档</button>
+        <button className="button subtle" disabled={busy} onClick={() => setConfirming(null)}>取消</button>
+        {confirming === 'archive' ? <button className="button primary" disabled={busy}
+          onClick={() => void edit(() => api.archive(fish.id))}>确认归档</button>
+          : <button className="button subtle tank-danger" disabled={busy}
+            onClick={() => void edit(() => api.eject(fish.tankId, fish.id), onEject)}>确认请出</button>}
       </div>
     </div>}
   </Modal>

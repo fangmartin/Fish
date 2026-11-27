@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PNG } from 'pngjs'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Claim, Fish, FishProfile, GoldenFeast, GoldenFeastClaim, Keeper, KeeperResponse, Leaderboard, Pellet, RationState, TankView } from '../shared/contracts'
-import { GOLDEN_FEAST_LIFETIME_MS, MAX_ART_BYTES, MAX_ART_EDGE, MAX_RATIONS, RATION_REGEN_INTERVAL_MS, getStuffedComaMs } from '../shared/domain'
+import type { Claim, Fish, FishProfile, GoldenFeast, GoldenFeastClaim, Keeper, KeeperResponse, Leaderboard, Pellet, RationState, TankSummary, TankView } from '../shared/contracts'
+import { GOLDEN_FEAST_LIFETIME_MS, MAX_ART_BYTES, MAX_ART_EDGE, MAX_RATIONS, PUBLIC_TANK_ID, RATION_REGEN_INTERVAL_MS, getStuffedComaMs } from '../shared/domain'
 import { createApp } from '../server/app'
 
 const date = Date.parse('2026-03-04T15:58:00Z')
@@ -55,8 +55,8 @@ async function release(cookie: string, name: string, extra: object = {}) {
   return (await JSONresponse<{ fish: Fish }>(response, 201)).fish
 }
 
-async function drop(cookie: string, ip?: string) {
-  return JSONresponse<Pellet>(await request('/pellets/drop', { cookie, body: { x: 0.38, y: 0.44 }, ip }), 201)
+async function drop(cookie: string, ip?: string, scope: { tankId?: string; inviteCode?: string } = {}) {
+  return JSONresponse<Pellet>(await request('/pellets/drop', { cookie, body: { x: 0.38, y: 0.44, ...scope }, ip }), 201)
 }
 
 function claim(cookie: string, pelletId: string, winnerFishId: string) {
@@ -68,8 +68,8 @@ const jar = async (cookie: string) => {
   return { remainingRations: state.remainingRations, nextRationInSec: state.nextRationInSec }
 }
 
-async function openEvents(cookie?: string) {
-  const response = await request('/events', { cookie })
+async function openEvents(cookie?: string, query = '') {
+  const response = await request('/events' + query, { cookie })
   expect(response.headers.get('content-type')).toContain('text/event-stream')
   const reader = response.body!.getReader()
   const decoder = new TextDecoder()
@@ -101,7 +101,8 @@ async function openEvents(cookie?: string) {
 const view = (query = '', cookie?: string) =>
   request('/tank/view' + query, { cookie }).then(response => JSONresponse<TankView>(response))
 
-const manualFeast = (secret?: string) => request('/admin/golden-feast', { method: 'POST', secret })
+const manualFeast = (secret?: string, tankId?: string) =>
+  request('/admin/golden-feast', { method: 'POST', secret, body: tankId ? { tankId } : undefined })
 const claimFeast = (id: string, winnerFishId: string, cookie?: string) =>
   request(`/golden-feast/${id}/claim`, { cookie, body: { winnerFishId } })
 
@@ -280,7 +281,10 @@ describe('SQLite API', () => {
   })
 
   it('空缸不会生成鱼，重启后隐藏旧演示鱼并保留进食历史', async () => {
-    expect(await view()).toEqual({ fish: [], goldenFeast: null })
+    expect(await view()).toEqual({
+      tank: { id: PUBLIC_TANK_ID, name: '公共鱼缸', isPublic: true, isOwner: false, fishCount: 0, maxFish: null, myFishCount: 0, myFishLimit: 3 },
+      fish: [], goldenFeast: null,
+    })
     const assets = join(temp, 'data', 'fish')
     expect(readdirSync(assets)).toEqual([])
     const { cookie } = await register('访客')
@@ -851,5 +855,324 @@ describe('SQLite API', () => {
     } finally {
       await close()
     }
+  })
+})
+
+describe('协作鱼缸', () => {
+  const createTank = (cookie: string, name: string) =>
+    request('/tanks', { cookie, body: { name } }).then(response => JSONresponse<{ tank: TankSummary }>(response, 201))
+      .then(result => result.tank)
+  const joinTank = (cookie: string, inviteCode: string) => request('/tanks/join', { cookie, body: { inviteCode } })
+    .then(response => JSONresponse<{ tank: TankSummary }>(response)).then(result => result.tank)
+  const tankQuery = (tank: TankSummary) => '?tankId=' + tank.id
+  const inviteQuery = (tank: TankSummary) => '?inviteCode=' + tank.inviteCode
+  const tanks = (cookie?: string) => request('/tanks', { cookie })
+    .then(response => JSONresponse<{ publicTank: TankSummary; ownedTanks: TankSummary[]; joinedTanks: TankSummary[] }>(response))
+
+  it('自建缸限两个，邀请允许匿名围观并为登录的协作者保存成员身份', async () => {
+    const owner = await register('房主')
+    const guest = await register('受邀访客')
+    const stranger = await register('路人')
+    expect((await request('/tanks', { body: { name: '匿名缸' } })).status).toBe(401)
+    expect((await request('/tanks', { cookie: owner.cookie, body: { name: '🐠'.repeat(17) } })).status).toBe(400)
+    const livingRoom = await createTank(owner.cookie, ' 客厅缸 ')
+    const study = await createTank(owner.cookie, '书房缸')
+    expect(livingRoom).toMatchObject({
+      name: '客厅缸', isOwner: true, ownerId: owner.keeper.id, ownerNickname: owner.keeper.nickname,
+      fishCount: 0, maxFish: 20, myFishCount: 0, myFishLimit: 10, createdAt: time,
+    })
+    expect(livingRoom.inviteCode).toMatch(/^[ABCDEFGHJKLMNPQRSTUVWXYZ2-9]{8}$/)
+    expect(study.inviteCode).not.toBe(livingRoom.inviteCode)
+    expect((await request('/tanks', { cookie: owner.cookie, body: { name: '第三个缸' } })).status).toBe(409)
+    expect((await tanks(owner.cookie)).ownedTanks.map(tank => tank.id)).toEqual(expect.arrayContaining([livingRoom.id, study.id]))
+    expect(await tanks()).toMatchObject({ publicTank: { id: PUBLIC_TANK_ID }, ownedTanks: [], joinedTanks: [] })
+    expect((await request('/tank/view' + tankQuery(livingRoom))).status).toBe(403)
+    expect((await request('/events' + tankQuery(livingRoom), { cookie: stranger.cookie })).status).toBe(403)
+    expect((await request('/tanks/join', { cookie: stranger.cookie, body: { inviteCode: livingRoom.id } })).status).toBe(404)
+    expect((await request('/tank/view' + tankQuery(livingRoom) + '&inviteCode=' + study.inviteCode)).ok).toBe(false)
+    expect((await view(inviteQuery(livingRoom))).tank).toMatchObject({ id: livingRoom.id, isOwner: false, myFishLimit: 3 })
+    expect((await view(inviteQuery(livingRoom), guest.cookie)).tank.id).toBe(livingRoom.id)
+    expect((await view(tankQuery(livingRoom), guest.cookie)).tank.id).toBe(livingRoom.id)
+    const link = 'https://fish.example/?tank=' + livingRoom.inviteCode!.toLowerCase()
+    expect(await joinTank(guest.cookie, link)).toMatchObject({ id: livingRoom.id, isOwner: false })
+    expect((await tanks(guest.cookie)).joinedTanks.map(tank => tank.id)).toEqual([livingRoom.id])
+    expect((await tanks(stranger.cookie)).joinedTanks).toEqual([])
+  })
+
+  it('每缸放生额度独立，支持十条主人鱼、三条协作者鱼及全缸二十条', async () => {
+    const owner = await register('房主')
+    const tank = await createTank(owner.cookie, '二十条缸')
+    const scope = { tankId: tank.id }
+    const tryRelease = (cookie: string, body: object = scope) =>
+      request('/fish', { cookie, body: { name: '候补鱼', pngBase64: png(), ...body } })
+    const publicFish = await Promise.all([release(owner.cookie, '海鱼一'), release(owner.cookie, '海鱼二'), release(owner.cookie, '海鱼三')])
+    expect((await tryRelease(owner.cookie, {})).status).toBe(409)
+    const ownerFish = await Promise.all(Array.from({ length: 10 }, (_, index) => release(owner.cookie, `主人鱼 ${index}`, scope)))
+    expect((await tryRelease(owner.cookie)).status).toBe(409)
+    expect((await request(`/fish/${publicFish[0].id}/move`, { cookie: owner.cookie, body: { targetTankId: tank.id } })).status).toBe(409)
+
+    for (let index = 0; index < 3; index++) {
+      const guest = await register('朋友 ' + index, 'guest-' + index)
+      const migrant = await release(guest.cookie, '搬去朋友家的鱼')
+      expect(await JSONresponse(await request(`/fish/${migrant.id}/move`, {
+        cookie: guest.cookie, body: { inviteCode: tank.inviteCode },
+      }))).toMatchObject({ fish: { id: migrant.id, tankId: tank.id } })
+      await Promise.all(Array.from({ length: 2 }, (_, number) => release(guest.cookie, `朋友鱼 ${number}`, { inviteCode: tank.inviteCode })))
+      expect((await tryRelease(guest.cookie)).status).toBe(409)
+    }
+    const lateGuest = await register('第四位朋友', 'guest-4')
+    await joinTank(lateGuest.cookie, tank.inviteCode!)
+    const results = await Promise.all([tryRelease(lateGuest.cookie), tryRelease(lateGuest.cookie)])
+    expect(results.map(response => response.status).sort()).toEqual([201, 409])
+    expect(await JSONresponse(results.find(response => !response.ok)!, 409)).toMatchObject({
+      error: '这个自建鱼缸已经游满 20 条鱼啦',
+    })
+    const another = await release(lateGuest.cookie, '等候搬家的鱼')
+    expect(await JSONresponse(await request(`/fish/${another.id}/move`, {
+      cookie: lateGuest.cookie, body: { targetTankId: tank.id },
+    }), 409)).toMatchObject({ error: '这个自建鱼缸已经游满 20 条鱼啦' })
+    const custom = await view(inviteQuery(tank) + '&excludeIds=' + ownerFish[0].id, owner.cookie)
+    expect(custom.fish).toHaveLength(20)
+    expect(custom.fish.map(fish => fish.id)).toContain(ownerFish[0].id)
+    expect(custom.tank).toMatchObject({ fishCount: 20, myFishCount: 10, myFishLimit: 10 })
+    expect((await view()).fish.map(fish => fish.id).sort()).toEqual([...publicFish, another].map(fish => fish.id).sort())
+    expect(readdirSync(join(temp, 'data', 'fish'))).toHaveLength(24)
+  })
+
+  it('按缸隔离鱼图、详情、搜索、榜单和互动，鱼食罐跨缸共享', async () => {
+    const owner = await register('房主')
+    const guest = await register('访客')
+    const stranger = await register('路人')
+    const tank = await createTank(owner.cookie, '私家鱼缸')
+    const publicFish = await release(owner.cookie, '公共游鱼')
+    expect((await request('/pellets/drop', {
+      cookie: owner.cookie, body: { tankId: tank.id, x: 0.4, y: 0.4 },
+    })).status).toBe(409)
+    expect(await jar(owner.cookie)).toMatchObject({ remainingRations: 20 })
+    const first = await release(owner.cookie, '私家秘密鱼一', { tankId: tank.id })
+    const second = await release(owner.cookie, '私家秘密鱼二', { tankId: tank.id })
+    expect(first).toMatchObject({ tankId: tank.id, tankName: tank.name, assetUrl: `/api/assets/fish/${first.id}.png?invite=${tank.inviteCode}` })
+    const profile = '/fish/' + first.id
+    const artwork = '/assets/fish/' + first.id + '.png'
+    for (const path of [profile, artwork]) {
+      expect((await request(path, { cookie: stranger.cookie })).ok).toBe(false)
+      expect((await request(path + '?invite=00000000')).ok).toBe(false)
+      expect((await request(path + inviteQuery(tank))).status).toBe(200)
+    }
+    const pngResponse = await request(artwork + '?invite=' + tank.inviteCode)
+    expect(pngResponse.headers.get('content-type')).toBe('image/png')
+    expect(Buffer.from(await pngResponse.arrayBuffer()).toString('base64')).toBe(png())
+    expect((await request(artwork, { cookie: owner.cookie })).status).toBe(200)
+    expect((await view('?focusFishId=' + first.id)).fish.map(fish => fish.id)).toEqual([publicFish.id])
+    const search = '/fish/search?q=' + encodeURIComponent('秘密鱼')
+    expect(await JSONresponse(await request(search))).toEqual({ fish: [] })
+    expect(await JSONresponse(await request(search + '&tankId=' + tank.id), 403)).toMatchObject({ error: expect.any(String) })
+    expect(await JSONresponse(await request(search + '&inviteCode=' + tank.inviteCode))).toMatchObject({
+      fish: expect.arrayContaining([{ ...first }, { ...second }]),
+    })
+    const publicBoards = await JSONresponse<Leaderboard>(await request('/tank/leaderboard'))
+    const privateBoards = await JSONresponse<Leaderboard>(await request('/tank/leaderboard' + inviteQuery(tank)))
+    for (const name of ['gluttons', 'bullies', 'giants'] as const) {
+      expect(publicBoards[name].map(fish => fish.id)).toEqual([publicFish.id])
+      expect(privateBoards[name].map(fish => fish.id).sort()).toEqual([first.id, second.id].sort())
+    }
+
+    const knock = (cookie: string, victimFishId: string) =>
+      request('/tank/knockout', { cookie, body: { attackerFishId: first.id, victimFishId } })
+    expect((await knock(stranger.cookie, second.id)).status).toBe(403)
+    expect((await knock(owner.cookie, publicFish.id)).status).toBe(409)
+    expect((await request(profile + '/report', { cookie: stranger.cookie, method: 'POST' })).ok).toBe(false)
+    expect((await request('/pellets/drop', { cookie: stranger.cookie, body: { tankId: tank.id, x: 0.4, y: 0.4 } })).status).toBe(403)
+    expect(await jar(stranger.cookie)).toMatchObject({ remainingRations: 20 })
+    const privatePellet = await drop(guest.cookie, undefined, { inviteCode: tank.inviteCode })
+    expect(privatePellet.remainingRations).toBe(19)
+    expect((await request(artwork, { cookie: guest.cookie })).status).toBe(200)
+    expect((await knock(guest.cookie, second.id)).status).toBe(200)
+    expect((await claim(guest.cookie, privatePellet.pelletId, publicFish.id)).status).toBe(409)
+    expect(await JSONresponse(await claim(guest.cookie, privatePellet.pelletId, first.id))).toMatchObject({ fish: { id: first.id } })
+    const publicPellet = await drop(guest.cookie)
+    expect(publicPellet.remainingRations).toBe(18)
+    expect((await claim(guest.cookie, publicPellet.pelletId, first.id)).status).toBe(409)
+    expect(await JSONresponse(await claim(guest.cookie, publicPellet.pelletId, publicFish.id))).toMatchObject({ fish: { id: publicFish.id } })
+  })
+
+  it('搬家验证归属与目标容量，双方 SSE 仅收到各自鱼缸的事件', async () => {
+    const owner = await register('搬家人')
+    const other = await register('旁观者')
+    const tank = await createTank(owner.cookie, '新家')
+    const publicStream = await openEvents()
+    const customStream = await openEvents(undefined, inviteQuery(tank))
+    try {
+      const resident = await release(owner.cookie, '在家', { tankId: tank.id })
+      expect(await customStream.next()).toMatchObject({ name: 'fish_released', data: { fish: { id: resident.id } } })
+      const moving = await release(owner.cookie, '准备搬家')
+      expect(await publicStream.next()).toMatchObject({ name: 'fish_released', data: { fish: { id: moving.id } } })
+      const move = (cookie: string, targetTankId: string) =>
+        request(`/fish/${moving.id}/move`, { cookie, body: { targetTankId } })
+      const pendingPublicPellet = await drop(owner.cookie)
+      expect((await move(other.cookie, tank.id)).status).toBe(403)
+      expect(await JSONresponse(await move(owner.cookie, tank.id))).toMatchObject({ fish: { id: moving.id, tankId: tank.id } })
+      expect((await claim(owner.cookie, pendingPublicPellet.pelletId, moving.id)).status).toBe(409)
+      expect(await publicStream.next()).toEqual({ name: 'fish_left', data: { fishId: moving.id } })
+      expect(await customStream.next()).toMatchObject({ name: 'fish_released', data: { fish: { id: moving.id } } })
+      expect(await JSONresponse(await move(owner.cookie, tank.id))).toMatchObject({ fish: { id: moving.id, tankId: tank.id } })
+      const replacements: Fish[] = []
+      for (let index = 0; index < 3; index++) {
+        const replacement = await release(owner.cookie, '公共鱼 ' + index)
+        replacements.push(replacement)
+        expect(await publicStream.next()).toMatchObject({ name: 'fish_released', data: { fish: { id: replacement.id } } })
+      }
+      expect((await move(owner.cookie, PUBLIC_TANK_ID)).status).toBe(409)
+      await JSONresponse(await request(`/fish/${replacements[0].id}/archive`, { cookie: owner.cookie, method: 'POST' }))
+      expect(await publicStream.next()).toEqual({ name: 'fish_archived', data: { fishId: replacements[0].id } })
+      expect(await JSONresponse(await move(owner.cookie, PUBLIC_TANK_ID))).toMatchObject({ fish: { id: moving.id, tankId: PUBLIC_TANK_ID } })
+      expect(await customStream.next()).toEqual({ name: 'fish_left', data: { fishId: moving.id } })
+      expect(await publicStream.next()).toMatchObject({ name: 'fish_released', data: { fish: { id: moving.id } } })
+      expect((await view(inviteQuery(tank))).fish.map(fish => fish.id)).toEqual([resident.id])
+      expect((await request(`/fish/${replacements[0].id}/move`, { cookie: owner.cookie, body: { targetTankId: tank.id } })).status).toBe(409)
+    } finally {
+      await Promise.all([publicStream.close(), customStream.close()])
+    }
+  })
+
+  it('黄金大餐及普通喂食计数按鱼缸独立，跨缸标签页只积累一份在线鱼食', async () => {
+    const owner = await register('房东')
+    const stranger = await register('局外人')
+    const tank = await createTank(owner.cookie, '金鱼缸')
+    const scope = { tankId: tank.id }
+    const publicFish = await release(owner.cookie, '海鲷')
+    const privateFish = await release(owner.cookie, '金鳞', scope)
+    service.db.prepare('UPDATE fish SET experience = 55 WHERE id = ?').run(privateFish.id)
+    expect((await manualFeast('test-only-secret', 'missing-tank')).status).toBe(404)
+    const { goldenFeast: publicMeal } = await JSONresponse<{ goldenFeast: GoldenFeast }>(await manualFeast('test-only-secret'), 201)
+    for (let index = 0; index < 15; index++) {
+      const pellet = await drop(owner.cookie, undefined, scope)
+      await JSONresponse(await claim(owner.cookie, pellet.pelletId, privateFish.id))
+      if (index < 14) expect((await view(inviteQuery(tank))).goldenFeast).toBeNull()
+      time += 2_000
+    }
+    const customMeal = (await view(inviteQuery(tank))).goldenFeast!
+    expect(customMeal.id).not.toBe(publicMeal.id)
+    expect((await view()).goldenFeast).toEqual(publicMeal)
+    expect((await claimFeast(customMeal.id, privateFish.id, stranger.cookie)).status).toBe(403)
+    expect((await claimFeast(customMeal.id, publicFish.id, owner.cookie)).status).toBe(409)
+    expect((await claimFeast(publicMeal.id, privateFish.id, owner.cookie)).status).toBe(409)
+    expect(await JSONresponse(await claimFeast(customMeal.id, privateFish.id, owner.cookie))).toMatchObject({ fish: { id: privateFish.id } })
+    expect((await view(inviteQuery(tank))).goldenFeast).toBeNull()
+    expect((await view()).goldenFeast?.id).toBe(publicMeal.id)
+    expect(service.db.prepare('SELECT value FROM tank_state WHERE key = ?').get('normal_feeds_total')).toEqual({ value: 0 })
+    expect(service.db.prepare('SELECT value FROM tank_state WHERE key = ?').get('normal_feeds_total:' + tank.id)).toEqual({ value: 15 })
+    const publicStream = await openEvents(owner.cookie)
+    const customStream = await openEvents(owner.cookie, tankQuery(tank))
+    try {
+      time += RATION_REGEN_INTERVAL_MS
+      expect(await jar(owner.cookie)).toEqual({ remainingRations: 6, nextRationInSec: 60 })
+      await publicStream.close()
+      time += RATION_REGEN_INTERVAL_MS
+      expect(await jar(owner.cookie)).toEqual({ remainingRations: 7, nextRationInSec: 60 })
+      expect(await customStream.event('rations_updated')).toMatchObject({ remainingRations: 6 })
+    } finally {
+      await publicStream.close()
+      await customStream.close()
+    }
+  })
+
+  it('改名、轮换邀请、请出、离开及删除保留鱼和画作，结算状态安全过期', async () => {
+    const owner = await register('邀请者')
+    const guest = await register('协作者')
+    const tank = await createTank(owner.cookie, '深水缸')
+    await joinTank(guest.cookie, tank.inviteCode!)
+    const tankPath = '/tanks/' + tank.id
+    const stream = await openEvents(guest.cookie, tankQuery(tank))
+    const invitedObserver = await openEvents(undefined, inviteQuery(tank))
+    let rotated: TankSummary
+    try {
+      expect((await request(tankPath, { cookie: guest.cookie, method: 'PATCH', body: { name: '篡改' } })).status).toBe(403)
+      expect((await request(tankPath + '/rotate-invite', { cookie: guest.cookie, method: 'POST' })).status).toBe(403)
+      expect((await request(tankPath, { cookie: guest.cookie, method: 'DELETE' })).status).toBe(403)
+      expect(await JSONresponse(await request(tankPath, { cookie: owner.cookie, method: 'PATCH', body: { name: '珊瑚缸' } })))
+        .toMatchObject({ tank: { id: tank.id, name: '珊瑚缸' } })
+      expect(await stream.event('tank_updated')).toMatchObject({ tank: { id: tank.id, name: '珊瑚缸', isOwner: false } })
+      expect(await invitedObserver.event('tank_updated')).toMatchObject({ tank: { id: tank.id, name: '珊瑚缸' } })
+      const rotation = await JSONresponse<{ tank: TankSummary }>(await request(tankPath + '/rotate-invite', { cookie: owner.cookie, method: 'POST' }))
+      rotated = rotation.tank
+      expect(rotated.inviteCode).not.toBe(tank.inviteCode)
+      await expect(invitedObserver.next()).rejects.toThrow('Unexpected end of event stream')
+      expect((await request('/tank/view' + inviteQuery(tank))).status).toBe(404)
+      expect((await view(inviteQuery(rotated))).tank.id).toBe(tank.id)
+      expect((await view(tankQuery(tank), guest.cookie)).tank.id).toBe(tank.id)
+      expect(await stream.event('tank_updated')).toMatchObject({ tank: { id: tank.id, inviteCode: rotated.inviteCode } })
+
+      const scope = { tankId: tank.id }
+      const guestFish = await release(guest.cookie, '协作者鱼', scope)
+      const leave = () => request(tankPath + '/leave', { cookie: guest.cookie, method: 'POST' })
+      expect((await leave()).status).toBe(409)
+      expect(await JSONresponse(await request(tankPath + '/eject/' + guestFish.id, { cookie: owner.cookie, method: 'POST' })))
+        .toMatchObject({ fish: { id: guestFish.id, tankId: PUBLIC_TANK_ID, status: 'archived' } })
+      expect(await stream.event('fish_left')).toEqual({ fishId: guestFish.id })
+      await JSONresponse(await leave())
+      await expect(stream.next()).rejects.toThrow('Unexpected end of event stream')
+      expect((await tanks(guest.cookie)).joinedTanks).toEqual([])
+      expect((await request('/tank/view' + tankQuery(tank), { cookie: guest.cookie })).status).toBe(403)
+      expect((await request('/fish/' + guestFish.id, { cookie: guest.cookie })).status).toBe(200)
+    } finally {
+      await Promise.all([stream.close(), invitedObserver.close()])
+    }
+
+    const live = await release(owner.cookie, '离水鱼', { tankId: tank.id })
+    const archived = await release(owner.cookie, '提前归档鱼', { tankId: tank.id })
+    await JSONresponse(await request(`/fish/${archived.id}/archive`, { cookie: owner.cookie, method: 'POST' }))
+    const pellet = await drop(owner.cookie, undefined, { tankId: tank.id })
+    const { goldenFeast } = await JSONresponse<{ goldenFeast: GoldenFeast }>(await manualFeast('test-only-secret', tank.id), 201)
+    const observer = await openEvents(undefined, inviteQuery(rotated))
+    try {
+      expect(await JSONresponse(await request(tankPath, { cookie: owner.cookie, method: 'DELETE' })))
+        .toEqual({ deleted: true, archivedCount: 1 })
+      expect(await observer.event('tank_deleted')).toEqual({ tankId: tank.id })
+      expect((await request('/tank/view' + inviteQuery(rotated))).status).toBe(404)
+      expect((await view()).fish).toEqual([])
+      expect((await tanks(owner.cookie)).ownedTanks).toEqual([])
+      for (const id of [live.id, archived.id]) {
+        expect(await JSONresponse(await request('/fish/' + id, { cookie: owner.cookie })))
+          .toMatchObject({ fish: { id, status: 'archived', tankId: PUBLIC_TANK_ID } })
+        expect((await request(`/assets/fish/${id}.png`, { cookie: owner.cookie })).status).toBe(200)
+      }
+      expect(service.db.prepare('SELECT status FROM pellets WHERE id = ?').get(pellet.pelletId)).toEqual({ status: 'expired' })
+      expect(service.db.prepare('SELECT status FROM golden_feasts WHERE id = ?').get(goldenFeast.id)).toEqual({ status: 'expired' })
+    } finally {
+      await observer.close()
+    }
+  })
+
+  it('旧库迁移保留公共缸鱼、画作、已消费鱼食与活跃大餐，重复启动保留独立大餐', async () => {
+    const owner = await register('旧库主人')
+    const fish = await release(owner.cookie, '旧库鱼')
+    const pellet = await drop(owner.cookie)
+    await JSONresponse(await claim(owner.cookie, pellet.pelletId, fish.id))
+    const { goldenFeast: publicMeal } = await JSONresponse<{ goldenFeast: GoldenFeast }>(await manualFeast('test-only-secret'), 201)
+    service.db.exec(`
+      DROP TABLE tank_members;
+      DROP TABLE tanks;
+      DROP INDEX fish_tank_scope;
+      DROP INDEX golden_feast_active_per_tank;
+      ALTER TABLE fish DROP COLUMN tank_id;
+      ALTER TABLE pellets DROP COLUMN tank_id;
+      ALTER TABLE golden_feasts DROP COLUMN tank_id;
+      CREATE UNIQUE INDEX golden_feast_active ON golden_feasts(status) WHERE status = 'active';
+    `)
+    service.db.close()
+    service = openTestApp()
+    expect((await view()).fish).toMatchObject([{ id: fish.id, tankId: PUBLIC_TANK_ID, tankName: '公共鱼缸', experience: 1 }])
+    expect((await view()).goldenFeast).toEqual(publicMeal)
+    expect((await request(fish.assetUrl.slice(4))).status).toBe(200)
+    expect(service.db.prepare('SELECT tank_id, winner_fish_id FROM pellets WHERE id = ?').get(pellet.pelletId))
+      .toMatchObject({ tank_id: PUBLIC_TANK_ID, winner_fish_id: fish.id })
+    const tank = await createTank(owner.cookie, '迁移后新缸')
+    const { goldenFeast: customMeal } = await JSONresponse<{ goldenFeast: GoldenFeast }>(await manualFeast('test-only-secret', tank.id), 201)
+    service.db.close()
+    service = openTestApp()
+    expect((await view()).goldenFeast).toEqual(publicMeal)
+    expect((await view(inviteQuery(tank))).goldenFeast).toEqual(customMeal)
+    expect(service.db.prepare('PRAGMA foreign_key_check').all()).toEqual([])
   })
 })

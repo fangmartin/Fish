@@ -1,6 +1,5 @@
 import { useState, type FormEvent } from 'react'
-import type { KeeperResponse } from '../shared/contracts'
-import { MAX_ACTIVE_FISH_PER_KEEPER } from '../shared/domain'
+import type { Fish, KeeperResponse } from '../shared/contracts'
 import { api, copyText } from './api'
 import { Icon } from './icons'
 import { Modal } from './Modal'
@@ -10,7 +9,7 @@ export function KeeperModal({ state, message, onClose, onIdentity, onFish }: {
   message?: string
   onClose: () => void
   onIdentity: () => Promise<void>
-  onFish: (id: string) => void
+  onFish: (fish: Fish) => void
 }) {
   const [mode, setMode] = useState<'nickname' | 'recover'>('nickname')
   const [nickname, setNickname] = useState(state.keeper?.nickname ?? '')
@@ -74,13 +73,13 @@ export function KeeperModal({ state, message, onClose, onIdentity, onFish }: {
     {feedback && <p className="feedback" role="status">{feedback}</p>}
     {state.keeper && <>
       <div className="keeper-tabs" aria-label="我的鱼">
-        <button aria-pressed={tab === 'active'} onClick={() => setTab('active')}>我的在缸鱼（{state.activeFish.length}/{MAX_ACTIVE_FISH_PER_KEEPER}）</button>
+        <button aria-pressed={tab === 'active'} onClick={() => setTab('active')}>我的在缸鱼（共 {state.activeFish.length} 条）</button>
         <button aria-pressed={tab === 'archive'} onClick={() => setTab('archive')}>深海归档图鉴</button>
       </div>
       <div className="keeper-fish">
         {!fish.length && <p className="muted">{tab === 'active' ? '你还没有鱼，画一条让它下水吧。' : '图鉴里还没有归档的鱼。'}</p>}
-        {fish.map(item => <button className="fish-row" key={item.id} onClick={() => onFish(item.id)}>
-          <img src={item.assetUrl} alt="" /><span>{item.name}</span><strong>Lv.{item.level}</strong>
+        {fish.map(item => <button className="fish-row" key={item.id} onClick={() => onFish(item)}>
+          <img src={item.assetUrl} alt="" /><span>{item.name}{tab === 'active' && <small className="tank-badge">{item.tankName}</small>}</span><strong>Lv.{item.level}</strong>
           {item.isHidden && <small>已隐藏</small>}
         </button>)}
       </div>

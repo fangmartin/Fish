@@ -6,12 +6,13 @@ import { bodyLimit } from 'hono/body-limit'
 import { getCookie, setCookie } from 'hono/cookie'
 import { HTTPException } from 'hono/http-exception'
 import { streamSSE } from 'hono/streaming'
-import type { FeedingRecord, GoldenFeast, RationState, TankEvents, TankTicker } from '../shared/contracts'
+import type { FeedingRecord, GoldenFeast, RationState, TankEvents, TankSummary, TankTicker } from '../shared/contracts'
 import {
-  GOLDEN_FEAST_EVERY_FEEDS, GOLDEN_FEAST_LIFETIME_MS, MAX_ACTIVE_FISH_PER_KEEPER, MAX_ART_BYTES, MAX_ART_EDGE,
-  MAX_RATIONS, PELLET_LIFETIME_MS, RATION_REGEN_INTERVAL_MS, REPORT_HIDE_THRESHOLD, TANK_VIEW_LIMIT,
-  allocateStats, applyGoldenFeast, canRespec, consumeRation, feedFish, getBellyCapacity, getBellyState, getDigestIntervalMs,
-  getGrowth, settleOnlineRations, shanghaiDate, validateEyes,
+  GOLDEN_FEAST_EVERY_FEEDS, GOLDEN_FEAST_LIFETIME_MS, MAX_ART_BYTES, MAX_ART_EDGE, MAX_CUSTOM_TANKS_PER_KEEPER,
+  MAX_RATIONS, MAX_TOTAL_FISH_IN_CUSTOM_TANK, PELLET_LIFETIME_MS, PUBLIC_TANK_ID, RATION_REGEN_INTERVAL_MS,
+  REPORT_HIDE_THRESHOLD, TANK_VIEW_LIMIT, allocateStats, applyGoldenFeast, canPlaceFishInTank, canRespec, consumeRation,
+  feedFish, getBellyCapacity, getBellyState, getDigestIntervalMs, getGrowth, getKeeperTankFishLimit, normalizeInviteCode,
+  settleOnlineRations, shanghaiDate, validateEyes,
 } from '../shared/domain'
 import { parseArtwork } from './art'
 import { openStorage, presentFish, type AfterCommit, type FishRow, type KeeperRow } from './storage'
@@ -29,11 +30,23 @@ interface Options {
 interface PelletRow {
   id: string
   keeper_id: string
+  tank_id: string
   expires_at: number
   status: 'pending' | 'consumed' | 'cancelled' | 'expired'
 }
 
+type TankRow = {
+  id: string
+  name: string
+  owner_id: string
+  owner_nickname: string
+  invite_code: string
+  created_at: number
+}
+
+interface TankScope { tankId?: unknown; inviteCode?: unknown; requireMemberForWrite?: boolean }
 type EventListener = (event: keyof TankEvents, data: string) => void
+type TankSubscriber = { keeperId?: string; send: EventListener; close: () => void }
 interface OnlinePresence {
   streams: Set<EventListener>
   lastSettledAt: number
@@ -43,10 +56,18 @@ type RationRow = { rations: number; ration_progress_ms: number }
 const safeId = /^[a-z0-9-]{1,64}$/
 const cookieName = 'fish_keeper'
 const passcodeAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-const inTank = "f.status = 'active' AND f.is_hidden = 0"
+const inTank = "f.tank_id = ? AND f.status = 'active' AND f.is_hidden = 0"
+const publicTank = {
+  id: PUBLIC_TANK_ID, name: '公共鱼缸', owner_id: null, owner_nickname: null, invite_code: null, created_at: null,
+}
+type Tank = TankRow | typeof publicTank
+
+function randomCode(length: number) {
+  return Array.from(randomBytes(length), byte => passcodeAlphabet[byte & 31]).join('')
+}
 
 function createPasscode() {
-  const letters = Array.from(randomBytes(12), byte => passcodeAlphabet[byte & 31]).join('')
+  const letters = randomCode(12)
   return `FISH-${letters.slice(0, 4)}-${letters.slice(4, 8)}-${letters.slice(8)}`
 }
 
@@ -60,7 +81,8 @@ function shortName(value: unknown) {
   return text.length && [...text].length <= 16 && !/\p{Cc}/u.test(text) ? text : null
 }
 
-async function readBody(c: Context): Promise<Record<string, unknown>> {
+async function readBody(c: Context, allowEmpty = false): Promise<Record<string, unknown>> {
+  if (allowEmpty && !(await c.req.text())) return {}
   const value: unknown = await c.req.json().catch(() => null)
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail(400, '请求内容需要是 JSON 对象')
   return value as Record<string, unknown>
@@ -77,15 +99,22 @@ export function createApp(options: Options) {
   )
   const root = new Hono()
   const api = new Hono()
-  const listeners = new Set<EventListener>()
+  const tankSubscribers = new Map<string, Set<TankSubscriber>>()
   const onlineKeepers = new Map<string, OnlinePresence>()
   let regenTimer: ReturnType<typeof setInterval> | undefined
   const readRations = db.prepare('SELECT rations, ration_progress_ms FROM keepers WHERE id = ?')
   const writeRations = db.prepare('UPDATE keepers SET rations = ?, ration_progress_ms = ? WHERE id = ?')
+  const tankSelect = 'SELECT t.*, k.nickname AS owner_nickname FROM tanks t JOIN keepers k ON k.id = t.owner_id'
+  const findTank = (id: string) => db.prepare(`${tankSelect} WHERE t.id = ?`).get(id) as TankRow | undefined
+  const findInvite = (code: string) => db.prepare(`${tankSelect} WHERE t.invite_code = ?`).get(code) as TankRow | undefined
+  const readTankCounts = db.prepare(`
+    SELECT COUNT(*) AS fishCount, COUNT(CASE WHEN keeper_id = ? THEN 1 END) AS myFishCount
+    FROM fish WHERE tank_id = ? AND status = 'active'
+  `)
 
-  function broadcast<K extends Exclude<keyof TankEvents, 'rations_updated'>>(event: K, value: TankEvents[K]) {
+  function broadcastToTank<K extends Exclude<keyof TankEvents, 'rations_updated'>>(tankId: string, event: K, value: TankEvents[K]) {
     const data = JSON.stringify(value)
-    for (const listener of listeners) listener(event, data)
+    for (const subscriber of tankSubscribers.get(tankId) ?? []) subscriber.send(event, data)
   }
 
   function keeperFor(c: Context) {
@@ -98,6 +127,85 @@ export function createApp(options: Options) {
     return keeperFor(c) ?? fail(401, '请先设置养鱼人昵称')
   }
 
+  function tankCounts(tankId: string, keeperId?: string) {
+    return readTankCounts.get(keeperId ?? null, tankId) as { fishCount: number; myFishCount: number }
+  }
+
+  function presentTank(tank: Tank, keeperId?: string): TankSummary {
+    const isPublic = tank.id === PUBLIC_TANK_ID
+    const isOwner = tank.owner_id === keeperId
+    return {
+      id: tank.id, name: tank.name, isPublic, isOwner, ...tankCounts(tank.id, keeperId),
+      ownerId: tank.owner_id ?? undefined, ownerNickname: tank.owner_nickname ?? undefined,
+      inviteCode: tank.invite_code ?? undefined, createdAt: tank.created_at ?? undefined,
+      maxFish: isPublic ? null : MAX_TOTAL_FISH_IN_CUSTOM_TANK, myFishLimit: getKeeperTankFishLimit(tank.id, isOwner),
+    }
+  }
+
+  function isTankMember(tankId: string, keeperId: string) {
+    return !!db.prepare('SELECT 1 FROM tank_members WHERE tank_id = ? AND keeper_id = ?').get(tankId, keeperId)
+  }
+
+  function joinTank(tank: TankRow, keeperId: string) {
+    if (tank.owner_id === keeperId) return
+    db.prepare('INSERT OR IGNORE INTO tank_members(tank_id, keeper_id, joined_at) VALUES (?, ?, ?)')
+      .run(tank.id, keeperId, now())
+  }
+
+  function tankForInvite(value: unknown) {
+    const code = normalizeInviteCode(value)
+    return (code ? findInvite(code) : undefined) ?? fail(404, '这个鱼缸链接已失效')
+  }
+
+  function resolveTankAccess(c: Context, { tankId, inviteCode, requireMemberForWrite }: TankScope): Tank {
+    const keeper = requireMemberForWrite ? requireKeeper(c) : keeperFor(c)
+    if (tankId === PUBLIC_TANK_ID || (tankId === undefined && inviteCode === undefined)) return publicTank
+    const tank = tankId === undefined
+      ? tankForInvite(inviteCode)
+      : (typeof tankId === 'string' ? findTank(tankId) : undefined) ?? fail(404, '找不到这个鱼缸')
+    if (inviteCode !== undefined) {
+      if (tankId !== undefined && tankForInvite(inviteCode).id !== tank.id) fail(403, '需要邀请链接才能进入这个鱼缸')
+      if (keeper) joinTank(tank, keeper.id)
+    } else if (!keeper || (tank.owner_id !== keeper.id && !isTankMember(tank.id, keeper.id))) {
+      fail(403, '需要邀请链接才能进入这个鱼缸')
+    }
+    return tank
+  }
+
+  function queryTank(c: Context) {
+    return resolveTankAccess(c, { tankId: c.req.query('tankId'), inviteCode: c.req.query('inviteCode') })
+  }
+
+  function ownedTank(id: string, keeper: KeeperRow) {
+    if (id === PUBLIC_TANK_ID) fail(403, '只有鱼缸主人可以操作')
+    const tank = findTank(id) ?? fail(404, '找不到这个鱼缸')
+    if (tank.owner_id !== keeper.id) fail(403, '只有鱼缸主人可以操作')
+    return tank
+  }
+
+  function newInviteCode() {
+    let code = randomCode(8)
+    while (findInvite(code)) code = randomCode(8)
+    return code
+  }
+
+  function broadcastTankUpdate(tank: TankRow) {
+    for (const subscriber of tankSubscribers.get(tank.id) ?? []) {
+      subscriber.send('tank_updated', JSON.stringify({ tank: presentTank(tank, subscriber.keeperId) }))
+    }
+  }
+
+  function verifyPlacement(tank: Tank, keeperId: string, moving = false) {
+    const { fishCount, myFishCount } = tankCounts(tank.id, keeperId)
+    const placement = canPlaceFishInTank({
+      tankId: tank.id, isTankOwner: tank.owner_id === keeperId, keeperFishInTank: myFishCount, totalFishInTank: fishCount,
+    })
+    if (placement.ok) return
+    if (placement.reason === 'tank_full') fail(409, '这个自建鱼缸已经游满 20 条鱼啦')
+    fail(409, moving ? `你在目标鱼缸的在缸鱼已达上限（最多 ${placement.limit} 条）`
+      : `在缸鱼已满（最多 ${placement.limit} 条），请先深海归档一条鱼`)
+  }
+
   function requireAdmin(c: Context) {
     const expected = Buffer.from(options.adminSecret ?? '')
     const provided = Buffer.from(c.req.header('X-Admin-Secret') ?? '')
@@ -106,30 +214,31 @@ export function createApp(options: Options) {
 
   function activeFish(id: string) {
     const row = findFish(id)
-    if (!row || row.status !== 'active' || row.is_hidden) fail(409, '这条鱼已离开公共鱼缸')
+    if (!row || row.status !== 'active' || row.is_hidden) fail(409, '这条鱼已离开鱼缸')
     return row
   }
 
-  function ticker(kind: TankTicker['kind'], text: string, fishId: string, createdAt: number) {
-    broadcast('tank_ticker', { id: randomUUID(), kind, text, fishId, createdAt })
+  function ticker(tankId: string, kind: TankTicker['kind'], text: string, fishId: string, createdAt: number) {
+    broadcastToTank(tankId, 'tank_ticker', { id: randomUUID(), kind, text, fishId, createdAt })
   }
 
-  function activeFeast(time: number) {
+  function activeFeast(tankId: string, time: number) {
     return (db.prepare(`
       SELECT id, x, y, created_at AS createdAt, expires_at AS expiresAt
-      FROM golden_feasts WHERE status = 'active' AND expires_at > ?
-    `).get(time) as GoldenFeast | undefined) ?? null
+      FROM golden_feasts WHERE tank_id = ? AND status = 'active' AND expires_at > ?
+    `).get(tankId, time) as GoldenFeast | undefined) ?? null
   }
 
-  function spawnFeast(time: number) {
-    const existing = activeFeast(time)
+  function spawnFeast(tankId: string, time: number) {
+    const existing = activeFeast(tankId, time)
     if (existing) return { goldenFeast: existing, spawned: false }
-    db.prepare("UPDATE golden_feasts SET status = 'expired' WHERE status = 'active' AND expires_at <= ?").run(time)
+    db.prepare("UPDATE golden_feasts SET status = 'expired' WHERE tank_id = ? AND status = 'active' AND expires_at <= ?")
+      .run(tankId, time)
     const goldenFeast = {
       id: randomUUID(), x: 0.2 + Math.random() * 0.6, y: 0.14, createdAt: time, expiresAt: time + GOLDEN_FEAST_LIFETIME_MS,
     }
-    db.prepare(`INSERT INTO golden_feasts(id, x, y, created_at, expires_at, status)
-      VALUES (?, ?, ?, ?, ?, 'active')`).run(goldenFeast.id, goldenFeast.x, goldenFeast.y, time, goldenFeast.expiresAt)
+    db.prepare(`INSERT INTO golden_feasts(id, x, y, created_at, expires_at, status, tank_id)
+      VALUES (?, ?, ?, ?, ?, 'active', ?)`).run(goldenFeast.id, goldenFeast.x, goldenFeast.y, time, goldenFeast.expiresAt, tankId)
     return { goldenFeast, spawned: true }
   }
 
@@ -236,10 +345,10 @@ export function createApp(options: Options) {
     }
   }
 
-  function ensureTankCanEat(time: number) {
+  function ensureTankCanEat(tankId: string, time: number) {
     const swimmers = db.prepare(`
-      SELECT experience, appetite, belly_load, belly_full, belly_updated_at FROM fish WHERE status = 'active' AND is_hidden = 0
-    `).iterate() as Iterable<Pick<FishRow, 'experience' | 'appetite' | 'belly_load' | 'belly_full' | 'belly_updated_at'>>
+      SELECT experience, appetite, belly_load, belly_full, belly_updated_at FROM fish f WHERE ${inTank}
+    `).iterate(tankId) as Iterable<Pick<FishRow, 'experience' | 'appetite' | 'belly_load' | 'belly_full' | 'belly_updated_at'>>
     let hasFish = false
     for (const fish of swimmers) {
       hasFish = true
@@ -267,8 +376,15 @@ export function createApp(options: Options) {
 
   function visibleFish(id: string, c: Context) {
     const fish = findFish(id) ?? fail(404, '找不到这条鱼')
-    if ((fish.is_hidden || fish.status !== 'active') && keeperFor(c)?.id !== fish.keeper_id) {
-      fail(404, '找不到这条鱼')
+    const keeper = keeperFor(c)
+    if (keeper?.id === fish.keeper_id) return fish
+    if (fish.is_hidden || fish.status !== 'active') fail(404, '找不到这条鱼')
+    if (fish.tank_id !== PUBLIC_TANK_ID) {
+      const tank = findTank(fish.tank_id) ?? fail(404, '找不到这条鱼')
+      if (keeper && (tank.owner_id === keeper.id || isTankMember(tank.id, keeper.id))) return fish
+      const invite = c.req.query('invite') ?? c.req.query('inviteCode')
+      if (normalizeInviteCode(invite) !== tank.invite_code) fail(404, '找不到这条鱼')
+      if (keeper) joinTank(tank, keeper.id)
     }
     return fish
   }
@@ -342,22 +458,148 @@ export function createApp(options: Options) {
     const time = now()
     const fish = db.prepare(`${fishSelect} WHERE f.keeper_id = ? AND f.status = 'active' AND f.is_hidden = 0`)
       .all(keeper.id) as FishRow[]
-    for (const row of fish) broadcast('fish_updated', { fish: presentFish(row, time) })
+    for (const row of fish) broadcastToTank(row.tank_id, 'fish_updated', { fish: presentFish(row, time) })
     return c.json({ keeper: { ...keeper, nickname } })
+  })
+
+  api.get('/tanks', c => {
+    const keeperId = keeperFor(c)?.id
+    const owned = keeperId
+      ? db.prepare(`${tankSelect} WHERE t.owner_id = ? ORDER BY t.created_at, t.id`).all(keeperId) as TankRow[]
+      : []
+    const joined = keeperId
+      ? db.prepare(`${tankSelect} JOIN tank_members m ON m.tank_id = t.id
+        WHERE m.keeper_id = ? ORDER BY m.joined_at, t.id`).all(keeperId) as TankRow[]
+      : []
+    return c.json({
+      publicTank: presentTank(publicTank, keeperId),
+      ownedTanks: owned.map(tank => presentTank(tank, keeperId)),
+      joinedTanks: joined.map(tank => presentTank(tank, keeperId)),
+    })
+  })
+
+  api.post('/tanks', async c => {
+    const keeper = requireKeeper(c)
+    const name = shortName((await readBody(c)).name)
+    if (!name) fail(400, '鱼缸名需要 1～16 字')
+    const time = now()
+    const id = randomUUID()
+    const tank = transaction(() => {
+      const { count } = db.prepare('SELECT COUNT(*) AS count FROM tanks WHERE owner_id = ?').get(keeper.id) as { count: number }
+      if (count >= MAX_CUSTOM_TANKS_PER_KEEPER) fail(409, '每位养鱼人最多只能创建 2 个自建鱼缸')
+      db.prepare('INSERT INTO tanks(id, owner_id, name, invite_code, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(id, keeper.id, name, newInviteCode(), time, time)
+      return presentTank(findTank(id)!, keeper.id)
+    })
+    return c.json({ tank }, 201)
+  })
+
+  api.post('/tanks/join', async c => {
+    const keeper = requireKeeper(c)
+    const { inviteCode } = await readBody(c)
+    const tank = transaction(() => {
+      const row = tankForInvite(inviteCode)
+      joinTank(row, keeper.id)
+      return presentTank(row, keeper.id)
+    })
+    return c.json({ tank })
+  })
+
+  api.patch('/tanks/:id', async c => {
+    const keeper = requireKeeper(c)
+    const name = shortName((await readBody(c)).name)
+    if (!name) fail(400, '鱼缸名需要 1～16 字')
+    const tank = transaction(() => {
+      const row = ownedTank(c.req.param('id'), keeper)
+      db.prepare('UPDATE tanks SET name = ?, updated_at = ? WHERE id = ?').run(name, now(), row.id)
+      return { ...row, name }
+    })
+    broadcastTankUpdate(tank)
+    return c.json({ tank: presentTank(tank, keeper.id) })
+  })
+
+  api.post('/tanks/:id/rotate-invite', c => {
+    const keeper = requireKeeper(c)
+    const tank = transaction(() => {
+      const row = ownedTank(c.req.param('id'), keeper)
+      const inviteCode = newInviteCode()
+      db.prepare('UPDATE tanks SET invite_code = ?, updated_at = ? WHERE id = ?').run(inviteCode, now(), row.id)
+      return { ...row, invite_code: inviteCode }
+    })
+    for (const subscriber of tankSubscribers.get(tank.id) ?? []) {
+      if (!subscriber.keeperId) subscriber.close()
+    }
+    broadcastTankUpdate(tank)
+    return c.json({ tank: presentTank(tank, keeper.id) })
+  })
+
+  api.post('/tanks/:id/leave', c => {
+    const keeper = requireKeeper(c)
+    const id = c.req.param('id')
+    transaction(() => {
+      const tank = findTank(id) ?? fail(404, '找不到这个鱼缸')
+      if (tank.owner_id === keeper.id || !isTankMember(id, keeper.id)) fail(403, '只有受邀加入的养鱼人可以退出鱼缸')
+      if (tankCounts(id, keeper.id).myFishCount) fail(409, '请先将你在这个鱼缸里的鱼搬走或归档，再退出鱼缸')
+      db.prepare('DELETE FROM tank_members WHERE tank_id = ? AND keeper_id = ?').run(id, keeper.id)
+    })
+    for (const subscriber of tankSubscribers.get(id) ?? []) {
+      if (subscriber.keeperId === keeper.id) subscriber.close()
+    }
+    return c.json({ left: true })
+  })
+
+  api.delete('/tanks/:id', c => {
+    const keeper = requireKeeper(c)
+    const id = c.req.param('id')
+    const archivedCount = transaction(() => {
+      ownedTank(id, keeper)
+      const { changes } = db.prepare("UPDATE fish SET status = 'archived', tank_id = ?, updated_at = ? WHERE tank_id = ? AND status = 'active'")
+        .run(PUBLIC_TANK_ID, now(), id)
+      db.prepare("UPDATE fish SET tank_id = ? WHERE tank_id = ? AND status = 'archived'").run(PUBLIC_TANK_ID, id)
+      db.prepare("UPDATE pellets SET status = 'expired' WHERE tank_id = ? AND status = 'pending'").run(id)
+      db.prepare("UPDATE golden_feasts SET status = 'expired' WHERE tank_id = ? AND status = 'active'").run(id)
+      db.prepare('DELETE FROM tanks WHERE id = ?').run(id)
+      return Number(changes)
+    })
+    broadcastToTank(id, 'tank_deleted', { tankId: id })
+    return c.json({ deleted: true, archivedCount })
+  })
+
+  api.post('/tanks/:id/eject/:fishId', c => {
+    const keeper = requireKeeper(c)
+    const id = c.req.param('id')
+    const time = now()
+    const fish = transaction(() => {
+      ownedTank(id, keeper)
+      const row = findFish(c.req.param('fishId'))
+      if (!row || row.tank_id !== id || row.status !== 'active') fail(404, '这条鱼已离开鱼缸')
+      if (row.keeper_id === keeper.id) fail(403, '自己的鱼请直接归档')
+      db.prepare("UPDATE fish SET status = 'archived', tank_id = ?, updated_at = ? WHERE id = ?").run(PUBLIC_TANK_ID, time, row.id)
+      return presentFish(findFish(row.id)!, time)
+    })
+    broadcastToTank(id, 'fish_left', { fishId: fish.id })
+    return c.json({ fish })
   })
 
   api.get('/tank/view', c => {
     const keeper = keeperFor(c)
+    const tank = queryTank(c)
     const time = now()
+    const response = { tank: presentTank(tank, keeper?.id), goldenFeast: activeFeast(tank.id, time) }
+    if (tank.id !== PUBLIC_TANK_ID) {
+      const rows = db.prepare(`${fishSelect} WHERE ${inTank} ORDER BY f.updated_at DESC, f.id LIMIT ?`)
+        .all(tank.id, MAX_TOTAL_FISH_IN_CUSTOM_TANK) as FishRow[]
+      return c.json({ ...response, fish: rows.map(row => presentFish(row, time)) })
+    }
     const selected = new Map<string, FishRow>()
     const focus = c.req.query('focusFishId')
     if (focus && safeId.test(focus)) {
       const row = findFish(focus)
-      if (row?.status === 'active' && !row.is_hidden) selected.set(row.id, row)
+      if (row?.tank_id === tank.id && row.status === 'active' && !row.is_hidden) selected.set(row.id, row)
     }
     if (keeper) {
       const own = db.prepare(`${fishSelect} WHERE ${inTank} AND f.keeper_id = ? ORDER BY f.created_at DESC`)
-        .all(keeper.id) as FishRow[]
+        .all(tank.id, keeper.id) as FishRow[]
       for (const row of own) selected.set(row.id, row)
     }
     const excluded = (c.req.query('excludeIds') ?? '').split(',').filter(id => safeId.test(id)).slice(0, TANK_VIEW_LIMIT)
@@ -366,18 +608,19 @@ export function createApp(options: Options) {
       const omit = [...new Set([...selected.keys(), ...excluded])]
       const filter = omit.length ? `AND f.id NOT IN (${omit.map(() => '?').join(',')})` : ''
       const rows = db.prepare(`${fishSelect} WHERE ${inTank} ${filter} ORDER BY ${order} LIMIT ?`)
-        .all(...omit, limit) as FishRow[]
+        .all(tank.id, ...omit, limit) as FishRow[]
       for (const row of rows) selected.set(row.id, row)
     }
     fill(Math.min(12, TANK_VIEW_LIMIT - selected.size), 'f.updated_at DESC, RANDOM()')
     fill(TANK_VIEW_LIMIT - selected.size, 'RANDOM()')
-    return c.json({ fish: [...selected.values()].map(row => presentFish(row, time)), goldenFeast: activeFeast(time) })
+    return c.json({ ...response, fish: [...selected.values()].map(row => presentFish(row, time)) })
   })
 
   api.get('/tank/leaderboard', c => {
+    const tank = queryTank(c)
     const time = now()
     function top(order: string, ...params: string[]) {
-      const rows = db.prepare(`${fishSelect} WHERE ${inTank} ORDER BY ${order}, f.id LIMIT 5`).all(...params) as FishRow[]
+      const rows = db.prepare(`${fishSelect} WHERE ${inTank} ORDER BY ${order}, f.id LIMIT 5`).all(tank.id, ...params) as FishRow[]
       return rows.map(row => presentFish(row, time))
     }
     return c.json({
@@ -389,7 +632,7 @@ export function createApp(options: Options) {
 
   api.post('/tank/knockout', async c => {
     requireKeeper(c)
-    const { attackerFishId, victimFishId } = await readBody(c)
+    const { attackerFishId, victimFishId, inviteCode } = await readBody(c)
     if (typeof attackerFishId !== 'string' || !safeId.test(attackerFishId) ||
         typeof victimFishId !== 'string' || !safeId.test(victimFishId) || attackerFishId === victimFishId) {
       fail(400, '请选择两条不同的鱼')
@@ -399,21 +642,24 @@ export function createApp(options: Options) {
     const { fish, victim } = transaction(() => {
       const attacker = activeFish(attackerFishId)
       const victim = activeFish(victimFishId)
+      if (attacker.tank_id !== victim.tank_id) fail(409, '两条鱼需要在同一个鱼缸')
+      resolveTankAccess(c, { tankId: attacker.tank_id, inviteCode, requireMemberForWrite: true })
       db.prepare('UPDATE fish SET total_knockouts = total_knockouts + 1 WHERE id = ?').run(attacker.id)
       return { fish: presentFish(findFish(attacker.id)!, time), victim }
     })
-    broadcast('fish_updated', { fish })
-    ticker('knockout', `💥 ${fish.name} 把 ${victim.name} 撞晕了！`, fish.id, time)
+    broadcastToTank(fish.tankId, 'fish_updated', { fish })
+    ticker(fish.tankId, 'knockout', `💥 ${fish.name} 把 ${victim.name} 撞晕了！`, fish.id, time)
     return c.json({ fish })
   })
 
   api.get('/fish/search', c => {
+    const tank = queryTank(c)
     const query = (c.req.query('q') ?? '').trim().slice(0, 80)
     if (!query) return c.json({ fish: [] })
     const rows = db.prepare(`${fishSelect}
-      WHERE f.status = 'active' AND f.is_hidden = 0 AND
+      WHERE ${inTank} AND
         (instr(lower(f.name), lower(?)) > 0 OR instr(lower(k.nickname), lower(?)) > 0)
-      ORDER BY f.updated_at DESC LIMIT 20`).all(query, query) as FishRow[]
+      ORDER BY f.updated_at DESC LIMIT 20`).all(tank.id, query, query) as FishRow[]
     const time = now()
     return c.json({ fish: rows.map(row => presentFish(row, time)) })
   })
@@ -433,7 +679,7 @@ export function createApp(options: Options) {
 
   api.post('/fish', async c => {
     const keeper = requireKeeper(c)
-    const { name, pngBase64, eyes: rawEyes, tagline: rawTagline = '' } = await readBody(c)
+    const { name, pngBase64, eyes: rawEyes, tagline: rawTagline = '', tankId, inviteCode } = await readBody(c)
     const fishName = shortName(name)
     if (!fishName) fail(400, '鱼名需要 1～16 字')
     const eyes = validateEyes(rawEyes)
@@ -449,20 +695,19 @@ export function createApp(options: Options) {
     let wroteFile = false
     try {
       transaction(() => {
-        const { count } = db.prepare("SELECT COUNT(*) AS count FROM fish WHERE keeper_id = ? AND status = 'active'")
-          .get(keeper.id) as { count: number }
-        if (count >= MAX_ACTIVE_FISH_PER_KEEPER) fail(409, '在缸鱼已满，请先深海归档一条鱼')
+        const tank = resolveTankAccess(c, { tankId, inviteCode, requireMemberForWrite: true })
+        verifyPlacement(tank, keeper.id)
         wroteFile = true
         writeFileSync(path, artwork, { flag: 'wx' })
-        db.prepare('INSERT INTO fish(id, keeper_id, name, created_at, updated_at, eyes_json, tagline) VALUES (?, ?, ?, ?, ?, ?, ?)')
-          .run(id, keeper.id, fishName, time, time, JSON.stringify(eyes), tagline)
+        db.prepare('INSERT INTO fish(id, keeper_id, name, created_at, updated_at, eyes_json, tagline, tank_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(id, keeper.id, fishName, time, time, JSON.stringify(eyes), tagline, tank.id)
       })
     } catch (error) {
       if (wroteFile && (error as NodeJS.ErrnoException).code !== 'EEXIST') rmSync(path, { force: true })
       throw error
     }
     const fish = presentFish(findFish(id)!, time)
-    broadcast('fish_released', { fish })
+    broadcastToTank(fish.tankId, 'fish_released', { fish })
     return c.json({ fish }, 201)
   })
 
@@ -483,12 +728,36 @@ export function createApp(options: Options) {
   })
 
   api.post('/fish/:id/archive', c => {
-    const row = ownedFish(c.req.param('id'), requireKeeper(c))
-    if (row.status === 'archived') fail(409, '这条鱼已深海归档')
+    const keeper = requireKeeper(c)
     const time = now()
-    db.prepare("UPDATE fish SET status = 'archived', updated_at = ? WHERE id = ?").run(time, row.id)
-    broadcast('fish_archived', { fishId: row.id })
+    const row = transaction(() => {
+      const fish = ownedFish(c.req.param('id'), keeper)
+      if (fish.status === 'archived') fail(409, '这条鱼已深海归档')
+      db.prepare("UPDATE fish SET status = 'archived', tank_id = ?, updated_at = ? WHERE id = ?").run(PUBLIC_TANK_ID, time, fish.id)
+      return fish
+    })
+    broadcastToTank(row.tank_id, 'fish_archived', { fishId: row.id })
     return c.json({ fish: presentFish(findFish(row.id)!, time) })
+  })
+
+  api.post('/fish/:id/move', async c => {
+    const keeper = requireKeeper(c)
+    const { targetTankId, inviteCode } = await readBody(c)
+    const time = now()
+    const { fish, sourceTankId } = transaction(() => {
+      const row = ownedFish(c.req.param('id'), keeper)
+      if (row.status !== 'active' || row.is_hidden) fail(409, '只有在缸鱼可以搬家')
+      const target = resolveTankAccess(c, { tankId: targetTankId, inviteCode, requireMemberForWrite: true })
+      if (row.tank_id === target.id) return { fish: presentFish(row, time), sourceTankId: row.tank_id }
+      verifyPlacement(target, keeper.id, true)
+      db.prepare('UPDATE fish SET tank_id = ?, updated_at = ? WHERE id = ?').run(target.id, time, row.id)
+      return { fish: presentFish(findFish(row.id)!, time), sourceTankId: row.tank_id }
+    })
+    if (sourceTankId !== fish.tankId) {
+      broadcastToTank(sourceTankId, 'fish_left', { fishId: fish.id })
+      broadcastToTank(fish.tankId, 'fish_released', { fish })
+    }
+    return c.json({ fish })
   })
 
   api.post('/fish/:id/stats', async c => {
@@ -506,7 +775,7 @@ export function createApp(options: Options) {
       return findFish(fish.id)!
     })
     const fish = presentFish(row, time)
-    if (fish.status === 'active' && !fish.isHidden) broadcast('fish_updated', { fish })
+    if (fish.status === 'active' && !fish.isHidden) broadcastToTank(fish.tankId, 'fish_updated', { fish })
     return c.json({ fish })
   })
 
@@ -522,58 +791,67 @@ export function createApp(options: Options) {
       return findFish(fish.id)!
     })
     const fish = presentFish(row, time)
-    if (fish.status === 'active' && !fish.isHidden) broadcast('fish_updated', { fish })
+    if (fish.status === 'active' && !fish.isHidden) broadcastToTank(fish.tankId, 'fish_updated', { fish })
     return c.json({ fish })
   })
 
-  api.post('/fish/:id/report', c => {
+  api.post('/fish/:id/report', async c => {
     const keeper = requireKeeper(c)
     const id = c.req.param('id')
-    const hidden = transaction(() => {
+    const { inviteCode } = await readBody(c, true)
+    const { hidden, tankId } = transaction(() => {
       const row = findFish(id) ?? fail(404, '找不到这条鱼')
       if (row.status !== 'active' || row.is_hidden) fail(404, '找不到这条鱼')
+      resolveTankAccess(c, { tankId: row.tank_id, inviteCode, requireMemberForWrite: true })
       const result = db.prepare('INSERT OR IGNORE INTO reports(fish_id, keeper_id) VALUES (?, ?)').run(id, keeper.id)
       if (!result.changes) fail(409, '你已经举报过这条鱼')
       const { count } = db.prepare('SELECT COUNT(*) AS count FROM reports WHERE fish_id = ?').get(id) as { count: number }
-      if (count < REPORT_HIDE_THRESHOLD) return false
+      if (count < REPORT_HIDE_THRESHOLD) return { hidden: false, tankId: row.tank_id }
       db.prepare('UPDATE fish SET is_hidden = 1 WHERE id = ?').run(id)
-      return true
+      return { hidden: true, tankId: row.tank_id }
     })
-    if (hidden) broadcast('fish_hidden', { fishId: id })
+    if (hidden) broadcastToTank(tankId, 'fish_hidden', { fishId: id })
     return c.json({ hidden })
   })
 
   api.delete('/admin/fish/:id', c => {
     requireAdmin(c)
     const id = c.req.param('id')
-    const result = db.prepare('UPDATE fish SET is_hidden = 1 WHERE id = ?').run(id)
-    if (!result.changes) fail(404, '找不到这条鱼')
-    broadcast('fish_hidden', { fishId: id })
+    const row = db.prepare('UPDATE fish SET is_hidden = 1 WHERE id = ? RETURNING tank_id').get(id) as { tank_id: string } | undefined
+    if (!row) fail(404, '找不到这条鱼')
+    broadcastToTank(row.tank_id, 'fish_hidden', { fishId: id })
     return c.json({ hidden: true })
   })
 
-  api.post('/admin/golden-feast', c => {
+  api.post('/admin/golden-feast', async c => {
     requireAdmin(c)
+    const { tankId = PUBLIC_TANK_ID } = await readBody(c, true)
     const time = now()
-    const { goldenFeast, spawned } = transaction(() => spawnFeast(time))
-    if (spawned) broadcast('golden_feast_spawned', { goldenFeast })
+    const { goldenFeast, spawned, id } = transaction(() => {
+      const tank = tankId === PUBLIC_TANK_ID ? publicTank
+        : (typeof tankId === 'string' ? findTank(tankId) : undefined) ?? fail(404, '找不到这个鱼缸')
+      return { ...spawnFeast(tank.id, time), id: tank.id }
+    })
+    if (spawned) broadcastToTank(id, 'golden_feast_spawned', { goldenFeast })
     return c.json({ goldenFeast }, spawned ? 201 : 200)
   })
 
   api.post('/pellets/drop', async c => {
     const keeper = requireKeeper(c)
-    const { x, y } = await readBody(c)
+    const { x, y, tankId, inviteCode } = await readBody(c)
     if (!coordinate(x) || !coordinate(y)) fail(400, '鱼食坐标需要在 0～1 之间')
     const time = now()
     const pelletId = randomUUID()
     const expiresAt = time + PELLET_LIFETIME_MS
     useRateLimit(c, 'drop', String(Math.floor(time / 60_000)), options.dropLimit ?? 30)
     const rationState = transaction(afterCommit => {
-      ensureTankCanEat(time)
-      db.prepare("UPDATE pellets SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?").run(time)
+      const tank = resolveTankAccess(c, { tankId, inviteCode, requireMemberForWrite: true })
+      ensureTankCanEat(tank.id, time)
+      db.prepare("UPDATE pellets SET status = 'expired' WHERE tank_id = ? AND status = 'pending' AND expires_at <= ?")
+        .run(tank.id, time)
       const rationState = syncKeeperRations(keeper.id, time, { afterCommit, spend: true })
-      db.prepare(`INSERT INTO pellets(id, keeper_id, x, y, expires_at, dropped_date, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'pending')`).run(pelletId, keeper.id, x, y, expiresAt, shanghaiDate(time))
+      db.prepare(`INSERT INTO pellets(id, keeper_id, x, y, expires_at, dropped_date, status, tank_id)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`).run(pelletId, keeper.id, x, y, expiresAt, shanghaiDate(time), tank.id)
       return rationState
     })
     return c.json({ pelletId, x, y, expiresAt, ...rationState }, 201)
@@ -582,7 +860,7 @@ export function createApp(options: Options) {
   api.post('/pellets/:pelletId/claim', async c => {
     const keeper = requireKeeper(c)
     const pelletId = c.req.param('pelletId')
-    const { winnerFishId } = await readBody(c)
+    const { winnerFishId, inviteCode } = await readBody(c)
     if (typeof winnerFishId !== 'string' || !safeId.test(winnerFishId)) fail(400, '需要指定有效的鱼')
     const time = now()
     const result = transaction(afterCommit => {
@@ -594,21 +872,26 @@ export function createApp(options: Options) {
         return null
       }
       const row = activeFish(winnerFishId)
+      if (row.tank_id !== pellet.tank_id) fail(409, '这条鱼已离开投放鱼食的鱼缸')
+      resolveTankAccess(c, { tankId: pellet.tank_id, inviteCode, requireMemberForWrite: true })
       const { fish, outcome, levelDelta } = settleFish(row, time, feedFish)
       db.prepare(`UPDATE pellets SET status = 'consumed', consumed_date = ?, consumed_at = ?, winner_fish_id = ?, outcome = ?
         WHERE id = ?`).run(shanghaiDate(time), time, row.id, outcome, pelletId)
-      const { value } = db.prepare("UPDATE tank_state SET value = value + 1 WHERE key = 'normal_feeds_total' RETURNING value")
-        .get() as { value: number }
+      const counter = pellet.tank_id === PUBLIC_TANK_ID ? 'normal_feeds_total' : `normal_feeds_total:${pellet.tank_id}`
+      const { value } = db.prepare(`
+        INSERT INTO tank_state(key, value) VALUES (?, 1)
+        ON CONFLICT(key) DO UPDATE SET value = value + 1 RETURNING value
+      `).get(counter) as { value: number }
       return {
         claim: { outcome, fish, levelDelta, ...rationState },
-        feast: value % GOLDEN_FEAST_EVERY_FEEDS === 0 ? spawnFeast(time) : null,
+        feast: value % GOLDEN_FEAST_EVERY_FEEDS === 0 ? spawnFeast(pellet.tank_id, time) : null,
       }
     })
     if (!result) fail(409, '这颗鱼食已失效')
     const { fish, outcome, levelDelta } = result.claim
-    broadcast('pellet_consumed', { pelletId, fish, outcome, levelDelta })
-    if (outcome === 'stuffed_full') ticker('stuffed', `🫧 ${fish.name} 彻底吃撑翻肚皮了！`, fish.id, time)
-    if (result.feast?.spawned) broadcast('golden_feast_spawned', { goldenFeast: result.feast.goldenFeast })
+    broadcastToTank(fish.tankId, 'pellet_consumed', { pelletId, fish, outcome, levelDelta })
+    if (outcome === 'stuffed_full') ticker(fish.tankId, 'stuffed', `🫧 ${fish.name} 彻底吃撑翻肚皮了！`, fish.id, time)
+    if (result.feast?.spawned) broadcastToTank(fish.tankId, 'golden_feast_spawned', { goldenFeast: result.feast.goldenFeast })
     return c.json(result.claim)
   })
 
@@ -628,43 +911,51 @@ export function createApp(options: Options) {
 
   api.post('/golden-feast/:id/claim', async c => {
     requireKeeper(c)
-    const { winnerFishId } = await readBody(c)
+    const { winnerFishId, inviteCode } = await readBody(c)
     if (typeof winnerFishId !== 'string' || !safeId.test(winnerFishId)) fail(400, '需要指定有效的鱼')
     const feastId = c.req.param('id')
     const time = now()
     const result = transaction(() => {
-      if (activeFeast(time)?.id !== feastId) fail(409, '这颗黄金大餐已失效')
       const row = activeFish(winnerFishId)
+      if (activeFeast(row.tank_id, time)?.id !== feastId) fail(409, '这颗黄金大餐已失效或不在同一个鱼缸')
+      resolveTankAccess(c, { tankId: row.tank_id, inviteCode, requireMemberForWrite: true })
       const { fish, outcome, levelDelta } = settleFish(row, time, applyGoldenFeast)
       db.prepare("UPDATE golden_feasts SET status = 'consumed', winner_fish_id = ?, consumed_at = ? WHERE id = ?")
         .run(row.id, time, feastId)
       return { feastId, fish, outcome, levelDelta, xpGained: fish.experience - row.experience }
     })
-    broadcast('golden_feast_consumed', result)
+    broadcastToTank(result.fish.tankId, 'golden_feast_consumed', result)
     const text = result.outcome === 'stuffed_full'
       ? `👑 ${result.fish.name} 一口吞下黄金大餐，直接撑翻了！`
       : `👑 ${result.fish.name} 抢走了天降黄金大餐！`
-    ticker('golden_feast', text, result.fish.id, time)
+    ticker(result.fish.tankId, 'golden_feast', text, result.fish.id, time)
     return c.json(result)
   })
 
   api.get('/events', c => {
     const keeper = keeperFor(c)
+    const { id: tankId } = queryTank(c)
     c.header('X-Accel-Buffering', 'no')
     return streamSSE(c, async stream => {
       await new Promise<void>(resolve => {
-        const listener: EventListener = (event, data) => {
-          void stream.writeSSE({ event, data })
+        const send: EventListener = (event, data) => {
+          const written = stream.writeSSE({ event, data })
+          if (event === 'tank_deleted') void written.then(finish)
         }
-        listeners.add(listener)
-        if (keeper) connectKeeper(keeper.id, listener)
+        const subscriber = { keeperId: keeper?.id, send, close: () => stream.abort() }
+        const subscribers = tankSubscribers.get(tankId) ?? new Set<TankSubscriber>()
+        subscribers.add(subscriber)
+        tankSubscribers.set(tankId, subscribers)
+        if (keeper) connectKeeper(keeper.id, send)
         const heartbeat = setInterval(() => void stream.writeSSE({ event: 'heartbeat', data: '{}' }), 25_000).unref()
-        stream.onAbort(() => {
+        function finish() {
+          if (!subscribers.delete(subscriber)) return
           clearInterval(heartbeat)
-          listeners.delete(listener)
-          if (keeper) disconnectKeeper(keeper.id, listener)
+          if (!subscribers.size) tankSubscribers.delete(tankId)
+          if (keeper) disconnectKeeper(keeper.id, send)
           resolve()
-        })
+        }
+        stream.onAbort(finish)
         void stream.writeSSE({ event: 'ready', data: '{}' })
       })
     })

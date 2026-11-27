@@ -5,9 +5,148 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#071929" />
     <title>潮汐鱼缸</title>
+    <style>
+      html { background: #061826; }
+      body { margin: 0; }
+      #boot-loader {
+        position: fixed;
+        z-index: 1000;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        color: #edf9f6;
+        background: radial-gradient(ellipse at 50% 38%, #0d2b40, #061826 75%);
+        font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+        text-align: center;
+        transition: opacity 280ms ease;
+      }
+      #boot-loader.is-leaving { opacity: 0; }
+      .boot-content { width: min(300px, 80vw); }
+      .boot-fish {
+        position: relative;
+        display: inline-block;
+        margin: 0 9px 16px 0;
+        width: 39px;
+        height: 24px;
+        border-radius: 60% 52% 52% 60%;
+        background: radial-gradient(circle at 27% 40%, #174054 1px, transparent 2px), #95e6d9;
+        box-shadow: 0 0 28px #75ded184;
+      }
+      .boot-fish::after {
+        position: absolute;
+        left: 35px;
+        top: 3px;
+        border-top: 9px solid transparent;
+        border-bottom: 9px solid transparent;
+        border-right: 12px solid #95e6d9;
+        content: '';
+      }
+      .boot-content h1 { margin: 0 0 27px; font-size: 27px; letter-spacing: .14em; }
+      .boot-track { height: 4px; border-radius: 999px; background: #bedfe42a; }
+      .boot-fill {
+        width: 12%;
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, #73dcd0, #ffda8e);
+        box-shadow: 0 0 13px #73dcd0a0;
+        transition: width 220ms ease;
+      }
+      #boot-percent { display: block; margin-top: 10px; color: #e6f5f4; font-size: 12px; font-variant-numeric: tabular-nums; }
+      #boot-caption { margin: 7px 0 0; color: #b4d4d9; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+      #boot-retry {
+        margin-top: 14px;
+        padding: 8px 16px;
+        border: 1px solid #a6ebd370;
+        border-radius: 8px;
+        background: #1d4450;
+        color: #edf9f6;
+        font: inherit;
+        cursor: pointer;
+      }
+      #boot-retry:focus-visible { outline: 2px solid #a6ebd3; outline-offset: 3px; }
+      @media (prefers-reduced-motion: reduce) {
+        #boot-loader, .boot-fill { transition: none; }
+      }
+    </style>
+    <script>
+      (() => {
+        const retryKey = 'fish_boot_retry_at'
+        let retrying = false
+        let failed = false
+
+        function reload() {
+          const url = new URL(location.href)
+          url.searchParams.set('_r', Date.now())
+          location.replace(url)
+        }
+
+        function showRecovery() {
+          if (retrying || failed || window.__FISH_APP_MOUNTED__) return
+          failed = true
+          const display = () => {
+            if (window.__FISH_APP_MOUNTED__) return
+            document.getElementById('boot-caption').textContent = '页面资源已更新或网络连接失败'
+            const button = document.getElementById('boot-retry')
+            button.textContent = '重新加载'
+            button.onclick = reload
+            button.hidden = false
+          }
+          if (document.getElementById('boot-loader')) display()
+          else document.addEventListener('DOMContentLoaded', display, { once: true })
+        }
+
+        function recover() {
+          if (retrying || failed || window.__FISH_APP_MOUNTED__) return
+          const now = Date.now()
+          const recent = value => Number(value) > now - 30_000 && Number(value) <= now
+          if (recent(new URL(location.href).searchParams.get('_r'))) return showRecovery()
+          try {
+            if (recent(sessionStorage.getItem(retryKey))) return showRecovery()
+            sessionStorage.setItem(retryKey, String(now))
+          } catch {
+            // The URL timestamp still bounds retries when browser storage is unavailable.
+          }
+          retrying = true
+          reload()
+        }
+
+        window.addEventListener('error', event => {
+          const target = event.target
+          const url = target instanceof HTMLScriptElement ? target.src : target instanceof HTMLLinkElement ? target.href : ''
+          if (url && new URL(url).pathname.startsWith('/assets/')) recover()
+        }, true)
+        window.addEventListener('vite:preloadError', recover)
+        window.setTimeout(showRecovery, 10_000)
+
+        let percent = 12
+        const creep = window.setInterval(() => {
+          const bar = document.getElementById('boot-track')
+          if (failed || retrying || window.__FISH_APP_MOUNTED__ || percent === 28) {
+            window.clearInterval(creep)
+          } else if (bar) {
+            percent += 2
+            bar.setAttribute('aria-valuenow', percent)
+            document.getElementById('boot-fill').style.width = `${percent}%`
+            document.getElementById('boot-percent').textContent = `${percent}%`
+          }
+        }, 180)
+      })()
+    </script>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="boot-loader">
+      <div class="boot-content">
+        <i class="boot-fish" aria-hidden="true"></i>
+        <h1>潮汐鱼缸</h1>
+        <div id="boot-track" class="boot-track" role="progressbar" aria-label="入缸进度" aria-valuenow="12">
+          <div id="boot-fill" class="boot-fill"></div>
+        </div>
+        <span id="boot-percent" aria-hidden="true">12%</span>
+        <p id="boot-caption" role="status">正在加载鱼缸界面…</p>
+        <button id="boot-retry" type="button" hidden></button>
+      </div>
+    </div>
+    <div id="root" inert></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

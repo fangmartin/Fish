@@ -1,8 +1,8 @@
 import { resolve } from 'node:path'
 import { serve } from '@hono/node-server'
 import { getConnInfo } from '@hono/node-server/conninfo'
-import { serveStatic } from '@hono/node-server/serve-static'
 import { createApp } from './app'
+import { attachStaticRoutes } from './static'
 
 function positiveInt(value: string | undefined, fallback: number) {
   const number = Number(value)
@@ -18,8 +18,7 @@ const { app, db, pauseRationRegen } = createApp({
   ip: c => getConnInfo(c).remote.address ?? 'unknown',
 })
 
-app.get('*', serveStatic({ root: './dist' }))
-app.get('*', serveStatic({ path: './dist/index.html' }))
+attachStaticRoutes(app, resolve('dist'))
 
 const server = serve({
   fetch: app.fetch,

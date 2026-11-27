@@ -5,17 +5,24 @@ import { Modal } from '../Modal'
 
 const names = { gluttons: '今日干饭王', bullies: '全缸恶霸', giants: '深海巨物' } as const
 
-export function LeaderboardModal({ onClose, onFish }: { onClose: () => void; onFish: (fish: Fish) => void }) {
+export function LeaderboardModal({ tankId, inviteCode, onClose, onFish }: {
+  tankId: string
+  inviteCode?: string
+  onClose: () => void
+  onFish: (fish: Fish) => void
+}) {
   const [tab, setTab] = useState<keyof Leaderboard>('gluttons')
   const [boards, setBoards] = useState<Leaderboard>()
   const [error, setError] = useState('')
   useEffect(() => {
     const controller = new AbortController()
-    void api.leaderboard(controller.signal).then(setBoards).catch(error => {
+    void api.leaderboard({ tankId, inviteCode }, controller.signal).then(boards => {
+      if (!controller.signal.aborted) setBoards(boards)
+    }).catch(error => {
       if (!controller.signal.aborted) setError(error instanceof Error ? error.message : '榜单暂时无法加载')
     })
     return () => controller.abort()
-  }, [])
+  }, [tankId, inviteCode])
 
   return <Modal title="鱼缸排行榜" onClose={onClose}>
     <div className="keeper-tabs" aria-label="趣味榜单">
